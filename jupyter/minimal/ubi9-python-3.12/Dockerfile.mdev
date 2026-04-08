@@ -1,0 +1,50 @@
+####################
+# base             #
+####################
+ARG BASE_IMAGE="us.icr.io/wxpe-cicd-internal/amd64/torch-aiu-runtime-dev"
+ARG BASE_IMAGE_TAG="latest"
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
+
+USER 0
+
+RUN useradd -u 1001 -g 0 -m -G wheel -s /bin/bash default && \
+    chmod -R ugo+rwX /usr/local/lib64/python3.12/site-packages && \
+    chmod -R ugo+rwX /usr/local/lib/python3.12/site-packages && \
+    chmod -R ugo+rwX /usr/local
+
+RUN chown -R default:1001 /usr/local/*
+
+# Other apps and tools installed as default user
+USER default
+
+ENV APP_ROOT=/opt/app-root
+ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src
+
+
+WORKDIR ${NOTEBOOK_ROOT_DIR}
+ENV HOME ${NOTEBOOK_ROOT_DIR}
+
+RUN mkdir -p ${APP_ROOT}/src \
+    && chown -R ${USER}:0 ${APP_ROOT} \
+    && chmod -R ugo+rwX ${APP_ROOT}
+
+ENV PATH="${HOME}/.local/bin:${PATH}"
+ENV PYTHONPATH="${HOME}.local/lib/python3.12/site-packages:${HOME}.local/lib64/python3.12/site-packages:${PYTHONPATH}"
+
+# Install jupyterlab and ipywidgets
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir jupyterlab && \
+    pip3 install --no-cache-dir --upgrade ipywidgets jupyterlab_widgets && \
+    pip3 install ibm-fms && \
+    pip3 install  --no-deps aiu-fms-testing-utils --index-url https://pypi.org/simple && \
+    pip3 show jupyterlab
+
+
+COPY --chown=${USER}:0 --chmod=755 jupyter/minimal/ubi9-python-3.12/start-notebook-mdev.sh /opt/app-root/bin/start-notebook.sh
+
+WORKDIR ${NOTEBOOK_ROOT_DIR}
+
+EXPOSE 8888
+
+ENTRYPOINT ["/opt/app-root/bin/start-notebook.sh"]
+

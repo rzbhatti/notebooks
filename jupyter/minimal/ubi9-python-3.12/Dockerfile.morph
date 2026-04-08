@@ -1,0 +1,48 @@
+####################
+# base             #
+####################
+ARG BASE_IMAGE="us.icr.io/wxpe-cicd-internal/amd64/torch-aiu-runtime-dev"
+ARG BASE_IMAGE_TAG="latest"
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
+
+USER 0
+
+
+
+# 1. Install sudo
+RUN dnf install -y sudo && dnf clean all
+
+# 2. Create user with UID 1001 and make 'root' (GID 0) their primary or secondary group
+# -g 0 sets the primary group to root
+# -G wheel allows them to use sudo
+RUN useradd -u 1001 -g 0 -m -G wheel -s /bin/bash default && \
+    echo "default ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+
+RUN chown -R 1001:1001 /usr/local/*
+
+# Other apps and tools installed as default user
+USER 1001
+
+ENV APP_ROOT=/opt/app-root
+ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src
+
+
+WORKDIR ${NOTEBOOK_ROOT_DIR}
+ENV HOME ${NOTEBOOK_ROOT_DIR}
+
+RUN mkdir -p ${APP_ROOT}/src \
+    && chown -R ${USER}:0 ${APP_ROOT} \
+    && chmod -R ugo+rwX ${APP_ROOT}
+
+ENV PATH="${HOME}/.local/bin:${PATH}"
+ENV PYTHONPATH="${HOME}.local/lib/python3.12/site-packages:${PYTHONPATH}"
+
+COPY --chown=${USER}:0 --chmod=755 jupyter/minimal/ubi9-python-3.12/start-notebook-morph.sh /opt/app-root/bin/start-notebook.sh
+
+WORKDIR ${NOTEBOOK_ROOT_DIR}
+
+EXPOSE 8888
+
+ENTRYPOINT ["/opt/app-root/src/start-notebook.sh"]
+

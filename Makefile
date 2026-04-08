@@ -140,9 +140,19 @@ jupyter-minimal-ubi9-python-$(RELEASE_PYTHON_VERSION):
 jupyter-datascience-ubi9-python-$(RELEASE_PYTHON_VERSION):
 	$(call image,$@,jupyter/datascience/ubi9-python-$(RELEASE_PYTHON_VERSION)/Dockerfile.cpu)
 
+
 .PHONY: cuda-jupyter-minimal-ubi9-python-$(RELEASE_PYTHON_VERSION)
 cuda-jupyter-minimal-ubi9-python-$(RELEASE_PYTHON_VERSION):
 	$(call image,$@,jupyter/minimal/ubi9-python-$(RELEASE_PYTHON_VERSION)/Dockerfile.cuda)
+
+
+.PHONY: spyre-jupyter-mdev-python-$(RELEASE_PYTHON_VERSION)
+spyre-jupyter-mdev-python-$(RELEASE_PYTHON_VERSION):
+	$(call image,$@,jupyter/minimal/ubi9-python-$(RELEASE_PYTHON_VERSION)/Dockerfile.mdev)
+
+.PHONY: spyre-jupyter-morph-python-$(RELEASE_PYTHON_VERSION)
+spyre-jupyter-morph-python-$(RELEASE_PYTHON_VERSION):
+	$(call image,$@,jupyter/minimal/ubi9-python-$(RELEASE_PYTHON_VERSION)/Dockerfile.morph)
 
 .PHONY: cuda-jupyter-tensorflow-ubi9-python-$(RELEASE_PYTHON_VERSION)
 cuda-jupyter-tensorflow-ubi9-python-$(RELEASE_PYTHON_VERSION):

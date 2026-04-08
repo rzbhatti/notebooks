@@ -50,7 +50,8 @@ export DT_DEEPRT_VERBOSE="-1"
 export INFER_SCRIPT=$(pip show aiu-fms-testing-utils | grep Location | cut -d ' ' -f 2)/aiu_fms_testing_utils/scripts/inference.py
 export HF_HUB_OFFLINE=0 
 export TORCH_SENDNN_CACHE_DIR=/dev/shm/cache
-
+unset COMPILATION_MODE
+unset FLEX_OVERWRITE_NMB_FRAME
 
 echo " " >> /tmp/aiu-query-devices.txt
 /opt/sentient/bin/aiu-query-devices >> /tmp/aiu-query-devices.txt

@@ -1,10 +1,26 @@
 #!/usr/bin/bash -l
 
-source /etc/profile.d/ibm-aiu-setup.sh
+mkdir -p ${NOTEBOOK_ROOT_DIR} 
+
+# && chown -R ${USER}:0 ${NOTEBOOK_ROOT_DIR} && chmod -R ugo+rwX ${NOTEBOOK_ROOT_DIR}
+
+# ENV PATH="${HOME}/.local/bin:${PATH}"
+# ENV PYTHONPATH="${HOME}.local/lib/python3.12/site-packages:${HOME}.local/lib64/python3.12/site-packages:${PYTHONPATH}"
+
+# Install Python packages on first run (deferred from build to avoid QEMU issues)
+if ! python3 -c "import jupyterlab" 2>/dev/null; then
+    echo "Installing Python packages (first run)..."
+    python3 -m pip install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir jupyterlab --extra-index-url https://pypi.org/simple && \
+    pip3 install --no-cache-dir --upgrade ipywidgets jupyterlab_widgets --extra-index-url https://pypi.org/simple && \
+    pip3 install ibm-fms --extra-index-url https://pypi.org/simple && \
+    pip3 install --no-deps aiu-fms-testing-utils --index-url https://pypi.org/simple && \
+    echo "Package installation complete!"
+fi
+
 
 # Load bash libraries
 SCRIPT_DIR=/opt/app-root/bin
-
 
 if [ -f "${SCRIPT_DIR}/utils/setup-elyra.sh" ]; then
   source ${SCRIPT_DIR}/utils/setup-elyra.sh
@@ -35,13 +51,9 @@ if [ -n "${NOTEBOOK_ARGS}" ]; then
     NOTEBOOK_PROGRAM_ARGS+=${NOTEBOOK_ARGS}
 fi
 
-cp /home/senuser/.bash* $HOME/
-chmod +x $HOME/.bash*
-. $HOME/.bash_profile
-
 export FLEX_DEVICE="PF"
 export FLEX_COMPUTE="SENTIENT"
-export FLEX_OVERWRITE_NMB_FRAME="1"
+# export FLEX_OVERWRITE_NMB_FRAME="1"
 export FLEX_UNLINK_DEVMEM="false"
 export PYTHONUNBUFFERED="1."
 export DTLOG_LEVEL="error"
@@ -53,11 +65,33 @@ export TORCH_SENDNN_CACHE_DIR=/dev/shm/cache
 unset COMPILATION_MODE
 unset FLEX_OVERWRITE_NMB_FRAME
 
+# Set up senlib configuration for AIU
+cp /opt/app-root/etc/senlib_config_aiusmi.json ~/senlib.json
+
+# Load IBM Spyre AIU setup
+source /etc/profile.d/ibm-aiu-setup.sh
+
+# Query AIU devices and save output to a file for display on notebook startup
+rm  -rf /tmp/aiu-query-devices.txt
 echo " " >> /tmp/aiu-query-devices.txt
 /opt/sentient/bin/aiu-query-devices >> /tmp/aiu-query-devices.txt
+ 
+if [ ! -f ~/.bashrc ]; then
+    cp /usr/share/rootfiles/.bashrc ~/
+fi
+
+if [ ! -f ~/.bash_logout]; then
+    cp /usr/share/rootfiles/.bash_logout ~/
+fi
+
+if [ ! -f ~/bash_profile ]; then
+    cp /usr/share/rootfiles/.bash_profile ~/
+fi
+
+touch ~/rzb-v20260410.0001
 
 echo """
-
+# Aliases
 alias ll='ls -alF'
 alias la='ls -A'
 alias l='ls -CF'
@@ -68,9 +102,9 @@ alias bd='popd'
 
 cat /tmp/aiu-query-devices.txt
 
-""" >> ~/.profile
+""" > ~/.profile
 
-chmod +x $HOME/.profile
+chmod +x ~/.profile
 
 echo "Running command: jupyter lab ${NOTEBOOK_PROGRAM_ARGS} \
     --ServerApp.ip=\"\" \

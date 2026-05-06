@@ -12,10 +12,26 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 ENV APP_ROOT=/opt/app-root
 ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src
 
-# Note: pip install commands are deferred to runtime to avoid QEMU emulation issues
-# They will be executed by the start-notebook.sh script on first run
+# Create directories if they do not exist and set permissions for user 1000930000
+RUN mkdir -p ${APP_ROOT}/src \
+    && mkdir -p ${NOTEBOOK_ROOT_DIR} 
 
+
+
+# Install jupyterlab and ipywidgets
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir --index-url https://pypi.org/simple jupyterlab && \
+    pip3 install --no-cache-dir --index-url https://pypi.org/simple --upgrade ipywidgets jupyterlab_widgets && \
+    pip3 install --no-deps --index-url https://pypi.org/simple aiu-fms-testing-utils==0.7.1 && \
+    pip3 show jupyterlab
+
+# Fix permissions for site-packages to allow user package installation/uninstallation
+RUN chmod -R g+w ${APP_ROOT}/lib/python3.12/site-packages 2>/dev/null || true && \
+    chmod -R g+w ${APP_ROOT}/lib64/python3.12/site-packages 2>/dev/null || true
+
+# Copy the start-notebook.sh script
 COPY --chown=default:0 --chmod=755 jupyter/minimal/ubi9-python-3.12/start-notebook-mdev.sh /opt/app-root/bin/start-notebook.sh
+
 
 WORKDIR ${NOTEBOOK_ROOT_DIR}
 

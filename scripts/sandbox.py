@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import json
-from typing import cast, Literal
+from typing import cast, Literal, Union, Optional
 
 ROOT_DIR = pathlib.Path(__file__).parent.parent
 MAKE = shutil.which("gmake") or shutil.which("make")
@@ -46,7 +46,7 @@ def main() -> int:
     build_args = extract_build_args(args.remaining[1:])
     prereqs = buildinputs(dockerfile=args.dockerfile, platform=args.platform, build_args=build_args)
 
-    with tempfile.TemporaryDirectory(delete=True) as tmpdir:
+    with tempfile.TemporaryDirectory() as tmpdir:
         setup_sandbox(prereqs, pathlib.Path(tmpdir))
         command = [arg if arg != "{};" else tmpdir for arg in args.remaining[1:]]
         print(f"running {command=}")
@@ -73,9 +73,9 @@ def extract_build_args(remaining: list[str]) -> dict[str, str]:
 
 
 def buildinputs(
-        dockerfile: pathlib.Path | str,
+        dockerfile: Union[pathlib.Path, str],
         platform: Literal["linux/amd64", "linux/arm64", "linux/s390x", "linux/ppc64le"] = "linux/amd64",
-        build_args: dict[str, str] | None = None
+        build_args: Optional[dict[str, str]] = None
 ) -> list[pathlib.Path]:
     if not (ROOT_DIR / "bin/buildinputs").exists():
         subprocess.check_call([MAKE, "bin/buildinputs"], cwd=ROOT_DIR)

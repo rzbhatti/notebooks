@@ -1,6 +1,6 @@
 #!/usr/bin/bash -l
 
-mkdir -p ${NOTEBOOK_ROOT_DIR} 
+# mkdir -p ${NOTEBOOK_ROOT_DIR} 
 
 # && chown -R ${USER}:0 ${NOTEBOOK_ROOT_DIR} && chmod -R ugo+rwX ${NOTEBOOK_ROOT_DIR}
 
@@ -8,15 +8,15 @@ mkdir -p ${NOTEBOOK_ROOT_DIR}
 # ENV PYTHONPATH="${HOME}.local/lib/python3.12/site-packages:${HOME}.local/lib64/python3.12/site-packages:${PYTHONPATH}"
 
 # Install Python packages on first run (deferred from build to avoid QEMU issues)
-if ! python3 -c "import jupyterlab" 2>/dev/null; then
-    echo "Installing Python packages (first run)..."
-    python3 -m pip install --no-cache-dir --upgrade pip && \
-    pip3 install --no-cache-dir jupyterlab --extra-index-url https://pypi.org/simple && \
-    pip3 install --no-cache-dir --upgrade ipywidgets jupyterlab_widgets --extra-index-url https://pypi.org/simple && \
-    pip3 install ibm-fms --extra-index-url https://pypi.org/simple && \
-    pip3 install --no-deps aiu-fms-testing-utils --index-url https://pypi.org/simple && \
-    echo "Package installation complete!"
-fi
+# if ! python3 -c "import jupyterlab" 2>/dev/null; then
+#     echo "Installing Python packages (first run)..."
+#     python3 -m pip install --no-cache-dir --upgrade pip && \
+#     pip3 install --no-cache-dir jupyterlab --extra-index-url https://pypi.org/simple && \
+#     pip3 install --no-cache-dir --upgrade ipywidgets jupyterlab_widgets --extra-index-url https://pypi.org/simple && \
+#     pip3 install ibm-fms --extra-index-url https://pypi.org/simple && \
+#     pip3 install --no-deps aiu-fms-testing-utils --index-url https://pypi.org/simple && \
+#     echo "Package installation complete!"
+# fi
 
 
 # Load bash libraries

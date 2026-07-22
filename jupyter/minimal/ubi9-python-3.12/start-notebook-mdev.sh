@@ -1,5 +1,8 @@
 #!/usr/bin/bash -l
 
+# create notebooks root
+mkdir -p ${NOTEBOOK_ROOT_DIR} 
+
 # Load bash libraries
 SCRIPT_DIR=/opt/app-root/bin
 
@@ -90,7 +93,7 @@ fi
 # source /etc/profile.d/ibm-aiu-setup.sh
 cat /tmp/aiu-query-devices.txt
 # switch to notebooks folder
-cd ~/../notebooks
+cd ~/notebooks
 
 """ > ~/.profile
 

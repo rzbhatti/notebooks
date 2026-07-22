@@ -11,7 +11,7 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 # to the entrypoint script to avoid issues during build.
 
 ENV APP_ROOT=/opt/app-root
-ENV NOTEBOOK_ROOT_DIR=/opt/app-root/notebooks
+ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src/notebooks
 
 # Create directories if they do not exist and set permissions for user 1000930000
 RUN mkdir -p ${APP_ROOT}/src && \
@@ -23,7 +23,6 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir --index-url https://pypi.org/simple jupyterlab && \
     pip3 install --no-cache-dir --index-url https://pypi.org/simple --upgrade ipywidgets jupyterlab_widgets && \
     pip3 install --no-deps --index-url https://pypi.org/simple aiu-fms-testing-utils==0.7.1 && \
-    ln -s ${NOTEBOOK_ROOT_DIR} ${APP_ROOT}/src/ && \
     cp ${APP_ROOT}/src/senlib*.json ${APP_ROOT}/etc && \
     pip3 show jupyterlab
 

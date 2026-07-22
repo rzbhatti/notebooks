@@ -1,24 +1,5 @@
 #!/usr/bin/bash -l
 
-# mkdir -p ${NOTEBOOK_ROOT_DIR} 
-
-# && chown -R ${USER}:0 ${NOTEBOOK_ROOT_DIR} && chmod -R ugo+rwX ${NOTEBOOK_ROOT_DIR}
-
-# ENV PATH="${HOME}/.local/bin:${PATH}"
-# ENV PYTHONPATH="${HOME}.local/lib/python3.12/site-packages:${HOME}.local/lib64/python3.12/site-packages:${PYTHONPATH}"
-
-# Install Python packages on first run (deferred from build to avoid QEMU issues)
-# if ! python3 -c "import jupyterlab" 2>/dev/null; then
-#     echo "Installing Python packages (first run)..."
-#     python3 -m pip install --no-cache-dir --upgrade pip && \
-#     pip3 install --no-cache-dir jupyterlab --extra-index-url https://pypi.org/simple && \
-#     pip3 install --no-cache-dir --upgrade ipywidgets jupyterlab_widgets --extra-index-url https://pypi.org/simple && \
-#     pip3 install ibm-fms --extra-index-url https://pypi.org/simple && \
-#     pip3 install --no-deps aiu-fms-testing-utils --index-url https://pypi.org/simple && \
-#     echo "Package installation complete!"
-# fi
-
-
 # Load bash libraries
 SCRIPT_DIR=/opt/app-root/bin
 
@@ -51,30 +32,31 @@ if [ -n "${NOTEBOOK_ARGS}" ]; then
     NOTEBOOK_PROGRAM_ARGS+=${NOTEBOOK_ARGS}
 fi
 
-export FLEX_DEVICE="PF"
-export FLEX_COMPUTE="SENTIENT"
+# export FLEX_DEVICE="PF"
+# export FLEX_COMPUTE="SENTIENT"
+export AIU_TOPO_FILE=/etc/ibm/spyre/topo.json
 # export FLEX_OVERWRITE_NMB_FRAME="1"
-export FLEX_UNLINK_DEVMEM="false"
+# export FLEX_UNLINK_DEVMEM="false"
 export PYTHONUNBUFFERED="1."
 export DTLOG_LEVEL="error"
 export TORCH_SENDNN_LOG="CRITICAL"
 export DT_DEEPRT_VERBOSE="-1"
 export INFER_SCRIPT=$(pip show aiu-fms-testing-utils | grep Location | cut -d ' ' -f 2)/aiu_fms_testing_utils/scripts/inference.py
-export HF_HUB_OFFLINE=0 
 export TORCH_SENDNN_CACHE_DIR=/dev/shm/cache
+unset HF_HUB_OFFLINE=0 
 unset COMPILATION_MODE
 unset FLEX_OVERWRITE_NMB_FRAME
 
 # Set up senlib configuration for AIU
-cp /opt/app-root/etc/senlib_config_aiusmi.json ~/senlib.json
+cp /opt/aiu-monitor/etc/senlib_config_aiusmi.json /opt/app-root/etc
+cp /opt/app-root/etc/senlib*.json /opt/app-root/src
 
 # Load IBM Spyre AIU setup
 source /etc/profile.d/ibm-aiu-setup.sh
 
-# Query AIU devices and save output to a file for display on notebook startup
-rm  -rf /tmp/aiu-query-devices.txt
-echo " " >> /tmp/aiu-query-devices.txt
-/opt/sentient/bin/aiu-query-devices >> /tmp/aiu-query-devices.txt
+# Run Query AIU devices 
+touch /tmp/run-aiu-query-devices
+
  
 if [ ! -f ~/.bashrc ]; then
     cp /usr/share/rootfiles/.bashrc ~/
@@ -88,8 +70,6 @@ if [ ! -f ~/bash_profile ]; then
     cp /usr/share/rootfiles/.bash_profile ~/
 fi
 
-touch ~/rzb-v20260410.0001
-
 echo """
 # Aliases
 alias ll='ls -alF'
@@ -100,7 +80,17 @@ alias h='history'
 alias fd='pushd'
 alias bd='popd' 
 
+# Run Query AIU devices and save output to a file for display on notebook startup
+if [ -f /tmp/run-aiu-query-devices ]; then 
+    source /etc/profile.d/ibm-aiu-setup.sh
+    /opt/sentient/bin/aiu-query-devices >> /tmp/aiu-query-devices.txt 
+    rm /tmp/run-aiu-query-devices
+fi
+
+# source /etc/profile.d/ibm-aiu-setup.sh
 cat /tmp/aiu-query-devices.txt
+# switch to notebooks folder
+cd ~/../notebooks
 
 """ > ~/.profile
 

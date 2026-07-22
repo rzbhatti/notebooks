@@ -1,8 +1,9 @@
 ####################
 # base             #
 ####################
-ARG BASE_IMAGE="registry.redhat.io/rhaii-early-access/vllm-spyre-rhel9"
-ARG BASE_IMAGE_TAG="3.4.0-ea.2"
+# Base image and tag are defined in build-args/mdev.conf
+ARG BASE_IMAGE
+ARG BASE_IMAGE_TAG
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 
 # Note: This Dockerfile is designed to work on both native Linux/x86_64 and
@@ -10,12 +11,11 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 # to the entrypoint script to avoid issues during build.
 
 ENV APP_ROOT=/opt/app-root
-ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src
+ENV NOTEBOOK_ROOT_DIR=/opt/app-root/notebooks
 
 # Create directories if they do not exist and set permissions for user 1000930000
-RUN mkdir -p ${APP_ROOT}/src \
-    && mkdir -p ${NOTEBOOK_ROOT_DIR} 
-
+RUN mkdir -p ${APP_ROOT}/src && \
+    mkdir -p ${NOTEBOOK_ROOT_DIR} 
 
 
 # Install jupyterlab and ipywidgets
@@ -23,11 +23,14 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir --index-url https://pypi.org/simple jupyterlab && \
     pip3 install --no-cache-dir --index-url https://pypi.org/simple --upgrade ipywidgets jupyterlab_widgets && \
     pip3 install --no-deps --index-url https://pypi.org/simple aiu-fms-testing-utils==0.7.1 && \
+    ln -s ${NOTEBOOK_ROOT_DIR} ${APP_ROOT}/src/ && \
+    cp ${APP_ROOT}/src/senlib*.json ${APP_ROOT}/etc && \
     pip3 show jupyterlab
 
 # Fix permissions for site-packages to allow user package installation/uninstallation
-RUN chmod -R g+w ${APP_ROOT}/lib/python3.12/site-packages 2>/dev/null || true && \
-    chmod -R g+w ${APP_ROOT}/lib64/python3.12/site-packages 2>/dev/null || true
+RUN chmod -R ug+w ${APP_ROOT}/lib/python3.12/site-packages 2>/dev/null || true && \
+    chmod -R ug+w ${APP_ROOT}/lib64/python3.12/site-packages 2>/dev/null || true && \
+    chmod -R ug+w ${APP_ROOT} 2>/dev/null || true 
 
 # Copy the start-notebook.sh script
 COPY --chown=default:0 --chmod=755 jupyter/minimal/ubi9-python-3.12/start-notebook-mdev.sh /opt/app-root/bin/start-notebook.sh

@@ -3,6 +3,7 @@ name: Test Provision K8s Action
 
 "on":
   push:
+    branches: [main, stable, 'rhoai-*']
     paths:
       - 'ci/cached-builds/**'
       - '.github/actions/provision-k8s/**'
@@ -12,11 +13,15 @@ name: Test Provision K8s Action
       - '.github/actions/provision-k8s/**'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-provisioning:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Provision K8s cluster
         uses: ./.github/actions/provision-k8s

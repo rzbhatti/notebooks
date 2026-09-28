@@ -6,93 +6,103 @@ import {GenericContainer} from "testcontainers";
 import {HttpWaitStrategy} from "testcontainers/build/wait-strategies/http-wait-strategy.js";
 
 import {CodeServer} from "./models/codeserver"
+import {log} from "./logger"
 
 import {setupTestcontainers} from "./testcontainers";
 
 import * as utils from './utils'
+import { assertUnreachable, type ConfigFixtures } from "./fixtures";
 
-// Declare the types of your fixtures.
-type MyFixtures = {
-  connectCDP: false | number;
-  codeServerSource: {url?: string, image?: string};
+// Extend shared config fixture types with test-specific fixtures.
+type TestFixtures = ConfigFixtures & {
   codeServer: CodeServer
 };
-const test = base.extend<MyFixtures>({
+const test = base.extend<TestFixtures>({
   connectCDP: [false, {option: true}],
-  codeServerSource: [{url:'http://localhost:8787'}, {option: true}],
+  codeServerSource: [{kind: 'url', url:'http://localhost:8787'}, {option: true}],
   page: async ({ page, connectCDP }, use) => {
     if (!connectCDP) {
       await use(page)
     } else {
       // we close the provided page and send onwards our own
       await page.close()
-      {
-        const browser = await chromium.connectOverCDP(`http://localhost:${connectCDP}`);
-        const defaultContext = browser.contexts()[0];
-        const page = defaultContext.pages()[0];
+      const browser = await chromium.connectOverCDP(`http://localhost:${connectCDP}`);
+      try {
+        const defaultContext = browser.contexts()[0]!;
+        const page = defaultContext.pages()[0]!;
         await use(page)
+      } finally {
+        // For CDP-connected browsers, close() disconnects without killing the process
+        await browser.close()
       }
     }
   },
   codeServer: [async ({ page, codeServerSource }, use) => {
-    if (codeServerSource?.url) {
-      await use(new CodeServer(page, codeServerSource.url))
-    } else {
-      const image = codeServerSource.image ?? (() => {
-        throw new Error("invalid config: codeserver image not specified")
-      })()
-      const container = await new GenericContainer(image)
-          .withExposedPorts(8787)
-          .withWaitStrategy(new HttpWaitStrategy('/?folder=/opt/app-root/src', 8787, {abortOnContainerExit: true}))
-          .start();
-      await use(new CodeServer(page, `http://${container.getHost()}:${container.getMappedPort(8787)}`))
-      await container.stop()
+    switch (codeServerSource.kind) {
+      case 'url':
+        await use(new CodeServer(page, codeServerSource.url));
+        break;
+      case 'image': {
+        const container = await new GenericContainer(codeServerSource.image)
+            .withExposedPorts(8787)
+            .withWaitStrategy(new HttpWaitStrategy('/?folder=/opt/app-root/src', 8787, {abortOnContainerExit: true}))
+            .start();
+        try {
+          await use(new CodeServer(page, `http://${container.getHost()}:${container.getMappedPort(8787)}`))
+        } finally {
+          await container.stop()
+        }
+        break;
+      }
+      default:
+        assertUnreachable(codeServerSource);
     }
   }, {timeout: 10 * 60 * 1000}],
 });
 
-test.beforeAll(setupTestcontainers)
+test.describe('code-server', { tag: '@codeserver' }, () => {
+  test.beforeAll(setupTestcontainers)
 
-test('open codeserver', async ({codeServer, page}) => {
-  await page.goto(codeServer.url)
+  test('open codeserver', async ({codeServer, page}) => {
+    await page.goto(codeServer.url)
 
-  await codeServer.isEditorVisible()
-})
-
-test('wait for welcome screen to load', async ({codeServer, page}, testInfo) => {
-  await page.goto(codeServer.url);
-
-  await codeServer.isEditorVisible()
-  page.on("console", console.log)
-
-  await codeServer.isEditorVisible()
-  await utils.waitForStableDOM(page, "div.monaco-workbench", 1000, 10000)
-  await utils.waitForNextRender(page)
-
-  await utils.takeScreenshot(page, testInfo, "welcome.png")
-})
-
-test('use the terminal to run command', async ({codeServer, page}, testInfo) => {
-  await page.goto(codeServer.url);
-
-  await test.step("Should always see the code-server editor", async () => {
     expect(await codeServer.isEditorVisible()).toBe(true)
   })
 
-  await test.step("should show the Integrated Terminal", async () => {
-    await codeServer.focusTerminal()
-    expect(await page.isVisible("#terminal")).toBe(true)
+  test('wait for startup surface to load', async ({codeServer, page}, testInfo) => {
+    await page.goto(codeServer.url);
+
+    expect(await codeServer.isEditorVisible()).toBe(true)
+    page.on("console", (msg) => log.info(msg.text()))
+
+    await utils.assertStartupSurface(page, testInfo)
   })
 
-  await test.step("should execute Terminal command successfully", async () => {
-    await page.keyboard.type('echo The answer is $(( 6 * 7 )). > answer.txt', {delay: 100})
-    await page.keyboard.press('Enter', {delay: 100})
-  })
+  test('use the terminal to run command', async ({codeServer, page}, _testInfo) => {
+    test.setTimeout(120_000)
+    await page.goto(codeServer.url);
 
-  await test.step("should open the file", async() => {
-    const file = path.join('/opt/app-root/src', 'answer.txt')
-    await codeServer.openFile(file)
-    await expect(page.getByText("The answer is 42.")).toBeVisible()
-  })
+    await test.step("Should always see the code-server editor", async () => {
+      expect(await codeServer.isEditorVisible()).toBe(true)
+    })
 
-})
+    await test.step("should show the Integrated Terminal", async () => {
+      await codeServer.focusTerminal()
+      await codeServer.waitForTerminalReady()
+      await expect(page.locator("#terminal")).toBeVisible()
+    })
+
+    await test.step("should execute Terminal command successfully", async () => {
+      await codeServer.runTerminalCommand("echo The answer is $(( 6 * 7 )). > answer.txt")
+      // Allow the shell redirect to flush before opening the file in the editor.
+      await page.waitForTimeout(1000)
+    })
+
+    await test.step("should open the file", async() => {
+      const file = path.join('/opt/app-root/src', 'answer.txt')
+      await codeServer.openFile(file)
+      await expect(page.locator(".editor-container").getByText("The answer is 42.", {exact: true})).toBeVisible()
+    })
+
+  })
+});

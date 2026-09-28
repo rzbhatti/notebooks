@@ -1,15 +1,17 @@
 from __future__ import annotations
 
-import functools
-import http.cookiejar
+import http.client
 import logging
 import os
+import pathlib
 import platform
+import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
+import allure
 import docker.types
 import pytest
 import testcontainers.core.container
@@ -20,12 +22,17 @@ import testcontainers.core.waiting_utils
 from tests.containers import docker_utils, kubernetes_utils, podman_machine_utils
 
 if TYPE_CHECKING:
-    import pytest_subtests
+    from types import TracebackType
+
+    from tests.containers.conftest import Image
 
 
 class TestWorkbenchImage:
-    """Tests for workbench images in this repository.
-    A workbench image is an image running a web IDE that listens on port 8888."""
+    """Smoke tests for JupyterLab and code-server images (``workbench_image`` / ``skip_if_not_workbench_image``).
+
+    RStudio is removed from the repo; older harness bits (TTY, tmpfs, cookies, extra PVC mounts) applied only there
+    and are not used for these IDEs.
+    """
 
     @pytest.mark.parametrize(
         "sysctls",
@@ -35,9 +42,8 @@ class TestWorkbenchImage:
             {"net.ipv6.conf.all.disable_ipv6": "1"},
         ],
     )
-    def test_image_entrypoint_starts(self, subtests: pytest_subtests.SubTests, workbench_image: str, sysctls) -> None:
-        container = WorkbenchContainer(image=workbench_image, user=1000, group_add=[0], sysctls=sysctls)
-        try:
+    def test_image_entrypoint_starts(self, subtests: pytest.Subtests, workbench_image: str, sysctls) -> None:
+        with WorkbenchContainer(image=workbench_image, user=1000, group_add=[0], sysctls=sysctls) as container:
             try:
                 container.start()
                 # check explicitly that we can connect to the ide running in the workbench
@@ -46,10 +52,8 @@ class TestWorkbenchImage:
             finally:
                 # try to grab logs regardless of whether container started or not
                 grab_and_check_logs(subtests, container)
-        finally:
-            docker_utils.NotebookContainer(container).stop(timeout=0)
 
-    def test_ipv6_only(self, subtests: pytest_subtests.SubTests, workbench_image: str, test_frame):
+    def test_ipv6_only(self, subtests: pytest.Subtests, workbench_image: str, test_frame):
         """Test that workbench image is accessible via IPv6.
         Workarounds for macOS will be needed, so that's why it's a separate test."""
 
@@ -67,12 +71,12 @@ class TestWorkbenchImage:
         )
         test_frame.append(network)
 
-        container = WorkbenchContainer(image=workbench_image)
-        container.with_network(network)
-        try:
+        with WorkbenchContainer(image=workbench_image) as container:
+            container.with_network(network)
             try:
                 client = testcontainers.core.docker_client.DockerClient()
-                rootless: bool = client.client.info()["Rootless"]
+                # Rootless is a podman-only flag; .get() defaults for Docker API compat
+                rootless: bool = client.client.info().get("Rootless", False)
                 # with rootful podman, --publish does not expose IPv6-only ports
                 # see https://github.com/containers/podman/issues/14491 and friends
                 container.start(wait_for_readiness=rootless)
@@ -109,8 +113,75 @@ class TestWorkbenchImage:
             finally:
                 # try to grab logs regardless of whether container started or not
                 grab_and_check_logs(subtests, container)
-        finally:
-            docker_utils.NotebookContainer(container).stop(timeout=0)
+
+    @pytest.mark.codeserver
+    def test_codeserver_starts_airgapped(self, subtests: pytest.Subtests, codeserver_image: Image) -> None:
+        """Smoke test: code-server must start and serve its UI without network access."""
+        with WorkbenchContainer(image=codeserver_image.name, user=1000, group_add=[0]) as container:
+            container.with_kwargs(network_mode="none")
+            try:
+                container.start(wait_for_readiness=False)
+                with subtests.test("Code-server serves UI without network"):
+                    _wait_for_http_inside_container(container)
+            finally:
+                # network_mode="none" means no network interface with a valid MAC address;
+                # code-server logs this harmlessly — https://github.com/microsoft/vscode/issues/175878
+                grab_and_check_logs(
+                    subtests,
+                    container,
+                    extra_allowed=[
+                        "Unable to retrieve mac address (unexpected format)",
+                    ],
+                )
+
+    @pytest.mark.codeserver
+    @allure.issue("RHAIENG-5652")
+    def test_nginx_absolute_redirect_off(self, subtests: pytest.Subtests, codeserver_image: Image) -> None:
+        """CWE-601: absolute_redirect off must be present in the live nginx config."""
+        with WorkbenchContainer(image=codeserver_image.name, user=1000, group_add=[0]) as container:
+            container.start(wait_for_readiness=True)
+            with subtests.test("absolute_redirect off is present in /etc/nginx/nginx.conf"):
+                exit_code, output = container.exec(["grep", "-r", "absolute_redirect off", "/etc/nginx/nginx.conf"])
+                assert exit_code == 0, (
+                    f"'absolute_redirect off' not found in /etc/nginx/nginx.conf — "
+                    f"open-redirect (CWE-601) mitigation may be missing.\nOutput: {output.decode()}"
+                )
+
+    @pytest.mark.codeserver
+    @allure.issue("RHAIENG-5652")
+    def test_nginx_no_open_redirect(self, subtests: pytest.Subtests, codeserver_image: Image) -> None:
+        """CWE-601 regression: return 302 rules must emit relative Location headers (FIND-011).
+
+        A forged Host header must not appear in the Location response header.
+        """
+        if codeserver_image.workbench_type.value == "che-code":
+            pytest.skip("Che Code does not expose the legacy code-server redirect routes")
+
+        redirect_paths = ["/", "/codeserver"]
+        forged_host = "evil.example"
+
+        with WorkbenchContainer(image=codeserver_image.name, user=1000, group_add=[0]) as container:
+            container.start(wait_for_readiness=True)
+            port = int(container.get_exposed_port(container.port))
+
+            for path in redirect_paths:
+                with subtests.test(f"GET {path} with forged Host must yield relative Location"):
+                    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    try:
+                        conn.request("GET", path, headers={"Host": forged_host})
+                        resp = conn.getresponse()
+                        assert resp.status == 302, f"Expected 302 for {path}, got {resp.status}"
+                        location = resp.getheader("Location", "")
+                        assert not location.startswith("http"), (
+                            f"Open redirect (CWE-601): GET {path} with Host:{forged_host} "
+                            f"returned absolute Location: {location!r}. "
+                            f"Expected a relative path (e.g. '/codeserver/')."
+                        )
+                        assert location.startswith("/"), (
+                            f"Location header for {path} is neither absolute nor relative: {location!r}"
+                        )
+                    finally:
+                        conn.close()
 
     @pytest.mark.openshift
     def test_image_run_on_openshift(self, workbench_image: str):
@@ -125,28 +196,14 @@ class TestWorkbenchImage:
 
 
 class WorkbenchContainer(testcontainers.core.container.DockerContainer):
-    @functools.wraps(testcontainers.core.container.DockerContainer.__init__)
+    """Testcontainer for JupyterLab and code-server only (see ``skip_if_not_workbench_image``)."""
+
     def __init__(
         self,
         port: int = 8888,
         **kwargs,
     ) -> None:
-        defaults = {
-            # because rstudio only prints out errors when TTY is present
-            # > TTY detected. Printing informational message about logging configuration.
-            "tty": True,
-            # another rstudio speciality, without this, it gives
-            # > system error 13 (Permission denied) [path: /opt/app-root/src/.cache/rstudio
-            # equivalent podman command may include
-            # > --mount type=tmpfs,dst=/opt/app-root/src,notmpcopyup
-            # can't use mounts= because testcontainers already sets volumes=
-            # > mounts=[docker.types.Mount(target="/opt/app-root/src/", source="", type="volume", no_copy=True)],
-            # can use tmpfs=, keep in mind `notmpcopyup` opt is podman specific
-            "tmpfs": {"/opt/app-root/src": "rw,notmpcopyup"},
-        }
-        if not kwargs.keys().isdisjoint(defaults.keys()):
-            raise TypeError(f"Keyword arguments in {defaults.keys()=} are not allowed, for good reasons")
-        super().__init__(**defaults, **kwargs)
+        super().__init__(**kwargs)
 
         self.port = port
         self.with_exposed_ports(self.port)
@@ -166,16 +223,19 @@ class WorkbenchContainer(testcontainers.core.container.DockerContainer):
 
         # connect
         host = container_host or self.get_container_host_ip()
+        # Podman publishes IPv4 ports; connecting to "localhost" may resolve to ::1 first.
+        if host == "localhost":
+            host = "127.0.0.1"
         port = container_port or self.get_exposed_port(self.port)
         try:
-            # if we did not enable cookie support here, with RStudio we'd end up looping and getting
-            # HTTP 302 (i.e. `except urllib.error.HTTPError as e: assert e.code == 302`) every time
-            cookie_jar = http.cookiejar.CookieJar()
-            opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cookie_jar))
             # host may be an ipv6 address, need to be careful with formatting this
-            if ":" in host:
-                host = f"[{host}]"
-            result = opener.open(urllib.request.Request(f"http://{host}:{port}{base_url}"), timeout=1)
+            host_for_url = f"[{host}]" if ":" in host else host
+            # /api redirects to /codeserver/healthz/ and avoids the / -> /codeserver/ hop
+            # (absolute redirects on / previously broke Podman port-forward readiness checks).
+            probe_path = base_url or "/api"
+            result = urllib.request.urlopen(
+                urllib.request.Request(f"http://{host_for_url}:{port}{probe_path}"), timeout=1
+            )
         except urllib.error.URLError as e:
             raise e
 
@@ -186,19 +246,70 @@ class WorkbenchContainer(testcontainers.core.container.DockerContainer):
         finally:
             result.close()
 
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc_val: BaseException | None, exc_tb: TracebackType | None
+    ) -> None:
+        with docker_utils.BestEffortCleanup(exc_type):
+            docker_utils.NotebookContainer(self).stop(timeout=0)
+
     def start(self, wait_for_readiness: bool = True) -> WorkbenchContainer:
         super().start()
         container_id = self.get_wrapped_container().id
-        docker_client = testcontainers.core.container.DockerClient().client
+        assert container_id is not None
+        docker_client = testcontainers.core.docker_client.DockerClient().client
         logging.debug(docker_client.api.inspect_container(container_id)["HostConfig"])
         if wait_for_readiness:
             self._connect()
         return self
 
+    def exec_script(
+        self,
+        script_content: str,
+        script_name: str = "test_script.py",
+        dest: str = "/opt/app-root/src",
+        python: str = "python",
+    ) -> tuple[int, str]:
+        """Copy a Python script into the container and execute it.
 
-def grab_and_check_logs(subtests: pytest_subtests.SubTests, container: WorkbenchContainer) -> None:
+        Note: script_name and dest are not sanitized against path traversal (CWE-22)
+        because all callers are hardcoded test code in this repo, not user input.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = pathlib.Path(tmpdir) / script_name
+            script_path.write_text(script_content)
+            docker_utils.container_cp(self.get_wrapped_container(), src=str(script_path), dst=dest)
+        exit_code, output = self.exec([python, f"{dest}/{script_name}"])
+        assert exit_code is not None, f"exec() returned no exit code for script {script_name}"
+        return exit_code, output.decode()
+
+
+def _wait_for_http_inside_container(container: WorkbenchContainer, port: int = 8888, timeout: float = 120) -> None:
+    """Poll HTTP readiness from inside the container (for network-isolated containers where port publishing is unavailable)."""
+    check_script = f"import urllib.request; urllib.request.urlopen('http://localhost:{port}', timeout=2)"
+    deadline = time.monotonic() + timeout
+    while True:
+        container.get_wrapped_container().reload()
+        status = container.get_wrapped_container().status
+        assert status != "exited", f"Container exited unexpectedly (status={status})"
+
+        exit_code, _ = container.exec(["python", "-c", check_script])
+        if exit_code == 0:
+            return
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"HTTP server on port {port} did not become ready within {timeout}s")
+        time.sleep(2)
+
+
+def grab_and_check_logs(
+    subtests: pytest.Subtests,
+    container: WorkbenchContainer,
+    extra_allowed: list[str] | None = None,
+) -> None:
     # Here is a list of blocked keywords we don't want to see in the log messages during the container/workbench
-    # startup (e.g., log messages from Jupyter IDE, code-server IDE or RStudio IDE).
+    # startup (e.g., log messages from Jupyter IDE or code-server IDE).
     blocked_keywords = [
         "Error",
         "error",
@@ -220,13 +331,22 @@ def grab_and_check_logs(subtests: pytest_subtests.SubTests, container: Workbench
     # Here is a list of allowed messages that match some block keyword from the list above, but we allow them
     # for some reason.
     allowed_messages = [
-        # We don't touch this - it should be fixed in the future by the package upgrade.
+        # RHAIENG-5767: jupyter-events package emits this on every JupyterLab start
         "JupyterEventsVersionWarning: The `version` property of an event schema must be a string. It has been type coerced, but in a future version of this library, it will fail to validate.",
+        # Che Code's bundled Node runtime emits this harmless deprecation warning during startup.
+        "[DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized",
+        "(Use `node --trace-deprecation ...` to show where the warning was created)",
         # This is a message from our reverse proxy nginx caused by the fact that we attempt to connect to the code-server before it's actually running (container.start(wait_for_readiness=True)).
         "connect() failed (111: Connection refused) while connecting to upstream, client",
-        # We use oauth-proxy to give us authentication, and we use OpenShift route to get HTTPS
+        # RHAIENG-5644: oauth-proxy / kube-rbac-proxy provides external auth; in-container Jupyter auth is disabled
         "WARNING: The Jupyter server is listening on all IP addresses and not using encryption. This is not recommended.",
     ]
+    if extra_allowed:
+        allowed_messages.extend(extra_allowed)
+
+    if container.get_wrapped_container() is None:
+        logging.warning("Skipping log check: container was never started")
+        return
 
     # Let's wait a couple of seconds to give a chance to log eventual extra startup messages just to be sure we don't
     # miss anything important in this test.

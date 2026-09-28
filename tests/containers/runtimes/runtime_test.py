@@ -1,12 +1,17 @@
 from __future__ import annotations
 
-import contextlib
+import pathlib
 
 import allure
 import pytest
-import testcontainers.core.container
 
 from tests.containers import base_image_test, conftest, docker_utils
+
+
+def _is_lean_runtime_image(runtime_image: conftest.Image) -> bool:
+    """True for phase-1 baseline / minimal runtimes without the datascience stack."""
+    name = runtime_image.labels["name"]
+    return "-minimal-" in name or "-baseline-" in name
 
 
 class TestRuntimeImage:
@@ -15,8 +20,7 @@ class TestRuntimeImage:
     @allure.description("Check that pyzmq library works correctly, important to check especially on s390x.")
     def test_pyzmq_import(self, runtime_image: conftest.Image) -> None:
         def check_zmq():
-            # ruff: noqa: PLC0415 `import` should be at the top-level of a file
-            import zmq  # pyright: ignore reportMissingImports
+            import zmq  # pyright: ignore reportMissingImports  # ruff: ignore[import-outside-top-level]
 
             context = zmq.Context()
             socket = None
@@ -28,7 +32,7 @@ class TestRuntimeImage:
                     socket.close(0)  # linger=0
                 context.term()
 
-        with running_image(runtime_image.name) as container:
+        with docker_utils.running_container(runtime_image.name) as container:
             exit_code, output_bytes = container.exec(
                 # NOTE: /usr/bin/python3 would not find zmq, we need python3 in user's venv
                 base_image_test.encode_python_function_execution_command_interpreter("python3", check_zmq)
@@ -39,16 +43,62 @@ class TestRuntimeImage:
             f"Expected success message not found in output. Output: {output_bytes}"
         )
 
+    @allure.description("Check that feast CLI works correctly (imports pyarrow._s3fs transitively).")
+    def test_feast_version(self, runtime_image: conftest.Image) -> None:
+        if _is_lean_runtime_image(runtime_image):
+            pytest.skip("Feast is not installed in minimal/baseline runtime images.")
 
-@contextlib.contextmanager
-def running_image(image: str):
-    """Usage: with running_image("quay.io/...") as container:"""
-    container = testcontainers.core.container.DockerContainer(image=image, user=23456, group_add=[0])
-    container.with_command("/bin/sh -c 'sleep infinity'")
-    try:
-        container.start()
-        yield container
-    except Exception as e:
-        pytest.fail(f"Unexpected exception in test: {e}")
-    finally:
-        docker_utils.NotebookContainer(container).stop(timeout=0)
+        with docker_utils.running_container(runtime_image.name) as container:
+            exit_code, output_bytes = container.exec(["/bin/sh", "-c", "feast version"])
+
+        output = output_bytes.decode()
+        assert exit_code == 0, f"'feast version' failed: {output}"
+
+    @allure.issue("AIPCC-13675")
+    @allure.description("Force UPB and run protobuf endian/packed roundtrips (catches silent s390x decode bugs).")
+    def test_protobuf_upb_roundtrips(self, runtime_image: conftest.Image) -> None:
+        if _is_lean_runtime_image(runtime_image):
+            pytest.skip("Protobuf/feast stack is not the focus of minimal/baseline runtime images.")
+
+        script = pathlib.Path(__file__).resolve().parents[1] / "workbenches" / "jupyterlab" / "protobuf_testunits.py"
+        with docker_utils.running_container(runtime_image.name) as container:
+            docker_utils.container_cp(container, script, "/opt/app-root/src/")
+            exit_code, output_bytes = container.exec(
+                [
+                    "env",
+                    "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=upb",
+                    "python3",
+                    "/opt/app-root/src/protobuf_testunits.py",
+                ]
+            )
+
+        output = output_bytes.decode()
+        assert exit_code == 0, f"protobuf_testunits failed: {output}"
+
+    @allure.description("Check that MLflow module imports and core functions are available.")
+    def test_mlflow_import(self, runtime_image: conftest.Image) -> None:
+        if _is_lean_runtime_image(runtime_image):
+            pytest.skip("MLflow is not installed in minimal/baseline runtime images.")
+
+        def check_mlflow():
+            import mlflow  # pyright: ignore reportMissingImports  # ruff: ignore[import-outside-top-level]
+
+            assert hasattr(mlflow, "start_run"), "MLflow does not have start_run function"
+            assert hasattr(mlflow, "log_param"), "MLflow does not have log_param function"
+            print(f"MLflow imported successfully (version: {mlflow.__version__})")
+
+        with docker_utils.running_container(runtime_image.name) as container:
+            exit_code, arch_output = container.exec(["uname", "-m"])
+            arch = arch_output.decode().strip()
+            if exit_code == 0 and arch == "s390x":
+                pytest.skip(
+                    "MLflow import skipped for s390x images (native stack unreliable under CI QEMU user emulation)."
+                )
+            exit_code, output_bytes = container.exec(
+                base_image_test.encode_python_function_execution_command_interpreter("python3", check_mlflow)
+            )
+
+        assert exit_code == 0, f"Python script execution failed. Output: {output_bytes}"
+        assert b"MLflow imported successfully" in output_bytes, (
+            f"Expected success message not found in output. Output: {output_bytes}"
+        )

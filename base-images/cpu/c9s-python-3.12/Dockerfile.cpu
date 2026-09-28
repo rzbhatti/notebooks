@@ -1,13 +1,13 @@
 ARG TARGETARCH
 
-FROM quay.io/centos/centos:stream9 AS buildscripts
+FROM quay.io/centos/centos:stream9@sha256:cfee9f59eb4d66295690829cebb75c6c97ca199c8929f8f933d88745280cbab4 AS buildscripts
 COPY base-images/utils/aipcc.sh /mnt/aipcc.sh
 COPY base-images/utils/fix-permissions base-images/utils/rpm-file-permissions /mnt/usr/bin/
 
 ####################
 # base             #
 ####################
-FROM quay.io/centos/centos:stream9 AS base
+FROM quay.io/centos/centos:stream9@sha256:cfee9f59eb4d66295690829cebb75c6c97ca199c8929f8f933d88745280cbab4 AS base
 
 ARG PYTHON_VERSION=3.12
 ENV PYTHON=python${PYTHON_VERSION}
@@ -36,6 +36,8 @@ ENV PATH=${HOME}/bin:${HOME}/.local/bin:${APP_ROOT}/bin:/usr/local/sbin:/usr/loc
 
 ### BEGIN AIPCC pip and uv config files
 ARG INDEX_URL
+ENV PIP_INDEX_URL=${INDEX_URL}
+ENV UV_INDEX_URL=${INDEX_URL}
 COPY --chmod=664 --chown=1001:0 base-images/utils/pip.conf.in /opt/app-root/pip.conf
 COPY --chmod=664 --chown=1001:0 base-images/utils/uv.toml.in /opt/app-root/uv.toml
 RUN /bin/bash <<'EOF'
@@ -83,6 +85,10 @@ set -Eeuxo pipefail
 /mnt/aipcc.sh
 fix-permissions ${APP_ROOT} -P
 EOF
+
+# PQC (OCP 5.0): enable the post-quantum crypto policy profile (C9S carries
+# the RHEL 9.8 PQ profile; RHEL 10 enables PQ by default).
+RUN update-crypto-policies --set DEFAULT:PQ
 
 RUN rpm-file-permissions
 

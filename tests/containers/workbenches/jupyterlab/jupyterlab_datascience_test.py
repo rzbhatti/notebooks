@@ -1,19 +1,17 @@
 from __future__ import annotations
 
-import pathlib
-import tempfile
 import typing
 
 import allure
-import pytest
 import testcontainers.core.network
 from testcontainers.core.waiting_utils import wait_for_logs
 from testcontainers.mysql import MySqlContainer
 
-from tests.containers import conftest, docker_utils
+from tests.containers import docker_utils
 from tests.containers.workbenches.workbench_image_test import WorkbenchContainer
 
 if typing.TYPE_CHECKING:
+    from tests.containers import conftest
     from tests.containers.conftest import Image
     from tests.containers.kubernetes_utils import TestFrame
 
@@ -54,22 +52,9 @@ assert pred[0] == 1, "Prediction is not as expected"
 
 print("Scikit-learn smoke test completed successfully.")
 """
-        test_script_name = "test_sklearn.py"
-        try:
+        with container:
             container.start(wait_for_readiness=True)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                tmpdir_path = pathlib.Path(tmpdir)
-                script_path = tmpdir_path / test_script_name
-                script_path.write_text(test_script_content)
-                docker_utils.container_cp(
-                    container.get_wrapped_container(),
-                    src=str(script_path),
-                    dst=self.APP_ROOT_HOME,
-                )
-
-            script_container_path = f"{self.APP_ROOT_HOME}/{test_script_name}"
-            exit_code, output = container.exec(["python", script_container_path])
-            output_str = output.decode()
+            exit_code, output_str = container.exec_script(test_script_content, script_name="test_sklearn.py")
 
             print(f"Script output:\n{output_str}")
 
@@ -77,12 +62,54 @@ print("Scikit-learn smoke test completed successfully.")
             assert "Scikit-learn smoke test completed successfully." in output_str
             assert "Prediction: [1]" in output_str
 
-        finally:
-            docker_utils.NotebookContainer(container).stop(timeout=0)
+    @allure.issue("RHAIENG-7433")
+    @allure.description(
+        "Regression: converting a pandas DataFrame with a datetime64 column to a pyarrow "
+        "Table must not segfault. Guards against a numpy ABI mismatch in pandas' datetime64 "
+        "C extension (observed with pandas 2.3.3 build-3 in RHOAI 3.6-EA1, RHAIENG-7433)."
+    )
+    def test_pandas_pyarrow_datetime64(self, datascience_image: conftest.Image) -> None:
+        container = WorkbenchContainer(image=datascience_image.name, user=4321, group_add=[0])
+        # language=Python
+        repro_script = """
+import sys
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+
+print(f"python: {sys.version.split()[0]}")
+print(f"numpy: {np.__version__}, pandas: {pd.__version__}, pyarrow: {pa.__version__}")
+
+df = pd.DataFrame({"t": [pd.Timestamp("2020-01-01")], "v": [1.0]})
+table = pa.Table.from_pandas(df)
+assert table.num_rows == 1, f"unexpected row count: {table.num_rows}"
+dtype = table.column("t").type
+assert str(dtype).startswith("timestamp"), f"unexpected datetime column type: {dtype}"
+print("pandas->pyarrow datetime64 conversion completed successfully.")
+"""
+        with container:
+            container.with_command("/bin/sh -c 'sleep infinity'")
+            container.start(wait_for_readiness=False)
+
+            # Match the interpreter present in the image: code-server exposes only python3.
+            name_label = datascience_image.labels.get("name", "")
+            is_codeserver = "-code-server-" in name_label or "codeserver" in datascience_image.name.lower()
+            python_exe = "/opt/app-root/bin/python3" if is_codeserver else "python"
+            print(f"Using python executable: {python_exe}")
+
+            exit_code, output = container.exec([python_exe, "-c", repro_script])
+            output_str = output.decode()
+            print(output_str)
+
+            assert exit_code == 0, (
+                f"pandas->pyarrow datetime64 conversion failed with exit code {exit_code} "
+                f"(139 = SIGSEGV, e.g. from a numpy ABI mismatch in pandas' datetime64 C extension)"
+            )
+            assert "pandas->pyarrow datetime64 conversion completed successfully." in output_str
 
     @allure.description("Check that mysql client functionality is working with SASL plain auth.")
     def test_mysql_connection(self, tf: TestFrame, datascience_image: Image, subtests):
-        MYSQL_CONNECTOR_PYTHON_VERSION = "9.5.0"
+        MYSQL_CONNECTOR_PYTHON_VERSION = "26.7.0"
 
         network = testcontainers.core.network.Network()
         tf.defer(network.create())
@@ -154,27 +181,31 @@ except Exception as e:
     raise
 """
 
-        container = WorkbenchContainer(image=datascience_image.name, user=4321, group_add=[0])
-        (container.with_network(network).with_command("/bin/sh -c 'sleep infinity'"))
-        try:
+        with WorkbenchContainer(image=datascience_image.name, user=4321, group_add=[0]) as container:
+            container.with_network(network).with_command("/bin/sh -c 'sleep infinity'")
             container.start(wait_for_readiness=False)
+            notebook = docker_utils.NotebookContainer(container)
+            notebook.require_running(context="after start")
+
+            # Use same interpreter for pip and -c so runtime-installed package is visible (PYTHONPATH).
+            # Code-server image uses /opt/app-root/bin/python3; others use default python.
+            # Detection: label "name" contains "-code-server-" (set in Dockerfile.konflux.cpu). Fallback: image ref
+            # contains "codeserver" when daemon is Podman and labels came from ContainerConfig (conftest handles that).
+            is_vscode = datascience_image.workbench_type.is_vscode
+            python_exe = "/opt/app-root/bin/python3" if is_vscode else "python"
+            print(f"Using python executable: {python_exe}")
 
             # RHOAIENG-140: code-server image users are expected to install their own db clients
-            if "-code-server-" in datascience_image.labels["name"]:
-                exit_code, output = container.exec(
-                    ["python", "-m", "pip", "install", f"mysql-connector-python=={MYSQL_CONNECTOR_PYTHON_VERSION}"]
+            if is_vscode:
+                exit_code, output = notebook.exec(
+                    [python_exe, "-m", "pip", "install", f"mysql-connector-python=={MYSQL_CONNECTOR_PYTHON_VERSION}"]
                 )
                 output_str = output.decode()
                 print(output_str)
-
                 assert exit_code == 0, f"Failed to install mysql-connector-python: {output_str}"
-            elif "-rstudio-" in datascience_image.labels["name"]:
-                pytest.skip(
-                    f"Image {datascience_image.name} does have -rstudio- in {datascience_image.labels['name']=}'"
-                )
 
             with subtests.test("Setting the user..."):
-                exit_code, output = container.exec(["python", "-c", setup_mysql_user])
+                exit_code, output = notebook.exec([python_exe, "-c", setup_mysql_user])
                 output_str = output.decode()
 
                 print(output_str)
@@ -183,12 +214,10 @@ except Exception as e:
                 assert exit_code == 0
 
             with subtests.test("Checking the output of the clearpassuser script..."):
-                exit_code, output = container.exec(["python", "-c", clearpassuser])
+                exit_code, output = notebook.exec([python_exe, "-c", clearpassuser])
                 output_str = output.decode()
 
                 print(output_str)
 
                 assert "MySQL connection successful!" in output_str
                 assert exit_code == 0
-        finally:
-            docker_utils.NotebookContainer(container).stop(timeout=0)

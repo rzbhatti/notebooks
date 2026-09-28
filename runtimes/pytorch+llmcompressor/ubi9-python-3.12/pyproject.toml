@@ -5,39 +5,72 @@ requires-python = "==3.12.*"
 
 dependencies = [
     # PyTorch packages
-    "tensorboard~=2.20.0",
-    "torch==2.9.1",
-    "torchvision==0.24.1",
+    "tensorboard",
+    "torch",
+    "torchvision",
 
     # llmcompressor packages
     "odh-notebooks-meta-llmcompressor-deps",
-    "lm-eval~=0.4.9",
+    # speculators 0.8.0 ships a vendored hs-connectors path dependency that
+    # 'uv pip compile' cannot resolve (URL deps must be direct requirements).
+    # Cap below 0.8 until speculators ships a lock-friendly 0.8.x release.
+    "speculators<0.8",
+    "lm-eval",
 
     # Datascience and useful extensions
-    "feast~=0.59.0",
     "odh-notebooks-meta-runtime-datascience-deps",
 
-    # DB connectors
-    "pymongo~=4.16.0",
-    "psycopg~=3.3.2",
-    "pyodbc~=5.3.0",
-    "mysql-connector-python~=9.5.0",
-
+    "odh-notebooks-meta-db-connectors-deps",
     "odh-notebooks-meta-runtime-elyra-deps",
+    "odh-notebooks-meta-runtime-kale-deps",
 
     # Base packages
-    "setuptools~=80.9.0",
-    "wheel==0.46.3",
+    "setuptools",
+    "wheel",
+
+    # Hermetic bootstrap: locked in requirements.*.txt; Dockerfile installs unpinned from find-links.
+    "micropipenv[toml]",
+    "uv",
 ]
 
 [tool.uv.sources]
-# https://github.com/astral-sh/uv/issues/13067#issuecomment-2824190008
+# speculators: resolve from default RH cuda index (same as cachi2 --index-url), not PyPI — RH wheels
+# differ from PyPI (e.g. …-8-… suffix) and mismatched hashes break Konflux prefetch.
 odh-notebooks-meta-llmcompressor-deps = { path = "../../../dependencies/odh-notebooks-meta-llmcompressor-deps" }
 odh-notebooks-meta-runtime-elyra-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-elyra-deps" }
 odh-notebooks-meta-runtime-datascience-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-datascience-deps" }
+odh-notebooks-meta-runtime-kale-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-kale-deps" }
+odh-notebooks-meta-db-connectors-deps = { path = "../../../dependencies/odh-notebooks-meta-db-connectors-deps" }
 
 [tool.uv]
+# RHAIENG-5451 / RHAIENG-7088: fail at lock-generation time (not inside the
+# Konflux build) if a package version lacks wheels for any architecture this
+# image ships. See opendatahub-io/notebooks#4422 for the dynamic alternative.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+# FIPS: exclude statically linked py-spy profiler (RHAIENG-58916)
+exclude-dependencies = ["py-spy"]
 
 environments = [
-    "sys_platform == 'linux' and implementation_name == 'cpython'",
+    "sys_platform == 'linux' and implementation_name == 'cpython' and python_full_version == '3.12.*'",
+]
+
+# May at some point these or some of these dependencies need to be remove as they will autoheal
+override-dependencies = [
+    # RHAIENG-2458: urllib3>=2.7.0 — CVE-2026-44431, CVE-2026-44432 (2.7.0); CVE-2025-66418 (2.6.0)
+    # Override needed because odh-elyra pulls in appengine-python-standard with urllib3<2
+    "urllib3>=2.7.0",
+    # AIPCC-13675: UPB segfault on s390x affects protobuf 6.33.5-6.33.6; fixed in 7.x.
+    # kfp 2.17.0's protobuf<7.0 is a conservative pin (gencode 6.31.1; APIs exist in 7.x).
+    # 7.x series only.
+    "protobuf>=7.36.1,<8",
+    # RHOAIENG-58615: CVE-2026-40192 Pillow FITS GZIP decompression bomb
+    "pillow>=12.2.0",
+    # RHAIENG-5267: requests==2.32 dep conflict with chardet
+    "requests>=2.33.1",
+    # RHAIENG-6408: CVE-2026-59890 — torch 2.11.0 wheel metadata caps setuptools<82;
+    # override until torch 2.13+ on AIPCC (pytorch#187262). Runtime qualification: test_image_entrypoint_starts.
+    "setuptools>=83.0.0",
 ]

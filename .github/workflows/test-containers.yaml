@@ -1,0 +1,247 @@
+---
+name: Test Infrastructure Self-Test
+
+"on":
+  workflow_dispatch:
+  pull_request:
+    paths: &test-containers-paths
+      - 'tests/containers/**'
+      - 'tests/conftest.py'
+      - 'pytest.ini'
+      - '.github/workflows/test-containers.yaml'
+      - 'ci/find_images_for_test_matrix.py'
+  push:
+    branches: [main, stable, 'rhoai-*']
+    paths: *test-containers-paths
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TESTCONTAINERS_RYUK_DISABLED: "true"
+  IMAGE_REGISTRY: "ghcr.io/${{ github.repository }}/workbench-images"
+  # pytest's --color=auto sees a non-tty stdout in CI and disables color;
+  # FORCE_COLOR forces it back on for the (colorable) GitHub Actions log viewer.
+  FORCE_COLOR: "1"
+
+jobs:
+  find-images:
+    permissions:
+      contents: read
+      packages: read
+    name: Find test images
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    runs-on: ubuntu-26.04
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 1
+          submodules: false
+          persist-credentials: false
+
+      - name: Find images for test matrix
+        id: find
+        env:
+          IMAGE_REGISTRY: ${{ env.IMAGE_REGISTRY }}
+          GH_TOKEN: ${{ github.token }}
+          REF_NAME: ${{ github.event.pull_request.base.ref || github.ref_name }}
+        shell: python
+        # language=python
+        run: |
+          import json, os, re, subprocess, sys
+          sys.path.insert(0, "ci")
+
+          from find_images_for_test_matrix import find_suitable_sha
+
+          registry = os.environ["IMAGE_REGISTRY"]
+          if os.environ.get("GITHUB_REPOSITORY") == "opendatahub-io/notebooks":
+              tag_suffix = "_odh_linux_amd64"
+          else:
+              tag_suffix = "_rhoai_linux_amd64"
+          required = [
+              "codeserver-ubi9-python-3.12",
+              "jupyter-minimal-ubi9-python-3.12",
+              "jupyter-datascience-ubi9-python-3.12",
+              "runtime-datascience-ubi9-python-3.12",
+          ]
+          # 40 is a placeholder cap, not derived from anything. The exactly-correct
+          # value would mirror build-notebooks-TEMPLATE.yaml's max_ref_len formula
+          # (128 - len(target) - 7-char short sha - len(suffix) - 3 separators),
+          # minimized over `required` since that formula is computed per target
+          # there. In practice it doesn't matter: real branch names (main, stable,
+          # rhoai-X.Y[-eaN]) are far shorter than either cap, so no truncation ever
+          # actually happens on either side.
+          ref_prefix = re.sub(r"[^a-zA-Z0-9._-]", "_", os.environ["REF_NAME"])[:40]
+
+          result = subprocess.run(
+              ["skopeo", "list-tags", "--creds", f"token:{os.environ['GH_TOKEN']}", f"docker://{registry}"],
+              capture_output=True, text=True, timeout=180,
+          )
+          if result.returncode != 0:
+              print(f"::error::skopeo list-tags failed: {result.stderr}", file=sys.stderr)
+              sys.exit(1)
+
+          sha = find_suitable_sha(ref_prefix, tag_suffix, required, result.stdout)
+          matrix = {"include": [
+              {"name": img, "image": f"{registry}:{img}-{ref_prefix}_{sha}{tag_suffix}"} for img in required
+          ]}
+          print(f"Using ref {ref_prefix!r}, SHA {sha}")
+          print(json.dumps(matrix, indent=2))
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"matrix={json.dumps(matrix)}\n")
+
+  container-tests:
+    permissions:
+      contents: read
+      packages: read
+    name: "${{ matrix.name }}"
+    needs: find-images
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.find-images.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
+
+      - name: Install deps
+        run: uv sync --locked
+
+      # Workaround: ubuntu-26.04 AppArmor stub profile for podman gives it a named label
+      # ("podman") instead of "unconfined". The pasta profile only allows signals from
+      # "unconfined" (via abstractions/base), so podman can't SIGTERM pasta on container
+      # stop → "rootless netns: kill network process: permission denied".
+      # Fix: allow pasta to receive signals from the podman profile.
+      # https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1100135
+      - name: Fix AppArmor pasta/podman signal conflict
+        run: |
+          set -Eeuxo pipefail
+          if [[ -f /etc/apparmor.d/abstractions/pasta ]] && ! grep -q 'peer=podman' /etc/apparmor.d/abstractions/pasta; then
+            echo '  signal (receive) peer=podman,' | sudo tee -a /etc/apparmor.d/abstractions/pasta
+            sudo apparmor_parser -r /etc/apparmor.d/usr.bin.pasta
+          fi
+
+      - name: Start Podman socket
+        run: |
+          set -Eeuxo pipefail
+          podman --version
+          systemctl --user enable --now podman.socket
+          echo "DOCKER_HOST=unix://$(podman info --format '{{.Host.RemoteSocket.Path}}')" >> "$GITHUB_ENV"
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and run tests
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+          LOG_PREFIX: ${{ matrix.name }}
+        run: |
+          set -Eeuxo pipefail
+          podman pull "${TEST_IMAGE}"
+          uv run pytest tests/containers \
+            -m 'not openshift and not cuda and not rocm and not manifest_validation' \
+            --image="${TEST_IMAGE}" \
+            --junitxml=junit.xml -o junit_family=legacy \
+            --log-level=DEBUG \
+            -o "log_file=logs/pytest-logs-${LOG_PREFIX}.txt" -o log_file_level=DEBUG \
+            -v
+
+      - name: Upload pytest debug log
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: pytest-logs-${{ matrix.name }}
+          path: logs/pytest-logs-${{ matrix.name }}.txt
+          archive: false
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3  # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: junit.xml
+
+      - name: Capture kernel logs on failure
+        if: ${{ failure() }}
+        uses: ./.github/actions/capture-kernel-logs
+        with:
+          log-prefix: ${{ matrix.name }}
+
+  openshift-container-tests:
+    permissions:
+      contents: read
+      packages: read
+    name: "openshift: ${{ matrix.name }}"
+    needs: find-images
+    runs-on: ubuntu-26.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.find-images.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
+
+      - name: Install deps
+        run: uv sync --locked
+
+      # Rootful podman sharing image storage with cri-o, same as build-notebooks-TEMPLATE.yaml,
+      # so the pod created by the openshift-marked tests can find the image without re-pulling.
+      - name: Install and configure Podman
+        uses: './.github/actions/install-podman-action'
+        with:
+          platform: linux/amd64
+
+      - name: Provision K8s cluster
+        uses: ./.github/actions/provision-k8s
+
+      - name: Login to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # install-podman-action's storage.conf enables zstd:chunked partial pulls, which
+      # only matters for `podman build`'s own registry pulls elsewhere. Here we `podman
+      # pull` an already-published ghcr.io image, and ghcr.io's blob endpoint returns
+      # "501 Unsupported client range" for partial/ranged fetches, failing the pull
+      # outright instead of falling back to a full one. Disable it for this job only.
+      - name: Disable zstd:chunked partial image pulls
+        run: sudo sed -i 's/enable_partial_images = "true"/enable_partial_images = "false"/' /etc/containers/storage.conf
+
+      - name: Pull and run OpenShift container tests
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+          DOCKER_HOST: "unix:///var/run/podman/podman.sock"
+          TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE: "/var/run/podman/podman.sock"
+        run: |
+          set -Eeuxo pipefail
+          podman pull "${TEST_IMAGE}"
+          uv run pytest --capture=fd tests/containers \
+            -m 'openshift and not cuda and not rocm' \
+            --image="${TEST_IMAGE}" \
+            --junitxml=junit-openshift.xml \
+            -v
+
+      - name: Upload test results
+        if: ${{ !cancelled() }}
+        uses: codecov/test-results-action@0fa95f0e1eeaafde2c782583b36b28ad0d8c77d3  # v1.2.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: junit-openshift.xml

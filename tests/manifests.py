@@ -17,15 +17,19 @@ if typing.TYPE_CHECKING:
 
 ROOT_DIR = Path(__file__).parent.parent
 
+MANIFESTS_ODH_DIR = ROOT_DIR / "manifests" / "odh"
+MANIFESTS_RHOAI_DIR = ROOT_DIR / "manifests" / "rhoai"
+
+_TEST_MANIFESTS_ODH_DIR = Path("notebooks/manifests/odh")  # for unit tests using relative paths
+
 JUPYTER_MINIMAL_NOTEBOOK_ID = "minimal"
+JUPYTER_BASELINE_NOTEBOOK_ID = "baseline"
 JUPYTER_DATASCIENCE_NOTEBOOK_ID = "datascience"
 JUPYTER_TRUSTYAI_NOTEBOOK_ID = "trustyai"
 JUPYTER_PYTORCH_NOTEBOOK_ID = "pytorch"
 JUPYTER_TENSORFLOW_NOTEBOOK_ID = "tensorflow"
 
 CODESERVER_NOTEBOOK_ID = "codeserver"
-
-RSTUDIO_NOTEBOOK_ID = "rstudio"
 
 MAKE = shutil.which("gmake") or shutil.which("make")
 
@@ -84,7 +88,7 @@ def extract_metadata_from_path(directory: Path) -> NotebookMetadata:
     # 2. Find the notebook's characteristic path components
     path_parts = directory.parts
     # Find the root component ('jupyter', 'runtimes', etc.) to anchor the search
-    for root_candidate in ("jupyter", "codeserver", "rstudio", "runtimes"):
+    for root_candidate in ("codeserver-baseline", "jupyter", "codeserver", "runtimes"):
         try:
             start_index = path_parts.index(root_candidate)
             break
@@ -94,16 +98,19 @@ def extract_metadata_from_path(directory: Path) -> NotebookMetadata:
         raise ValueError(f"Cannot determine notebook root in path: {directory}") from None
 
     # The parts between the root and the OS/python dir define the notebook flavor
-    # e.g., ('minimal',), ('rocm', 'tensorflow',), ('pytorch',)
+    # e.g., ('minimal',), ('baseline',), ('rocm', 'tensorflow',), ('pytorch',)
     notebook_identity_parts = path_parts[start_index + 1 : -1]
 
-    # Determine scope (e.g., 'minimal', 'tensorflow')
-    # The shell script uses the last part of the path-like notebook_id.
-    try:
-        scope = notebook_identity_parts[-1]
-    except IndexError:
-        # rstudio and codeserver don't have scope
-        scope = ""
+    if path_parts[start_index] == "codeserver-baseline":
+        scope = JUPYTER_BASELINE_NOTEBOOK_ID
+    else:
+        # Determine scope (e.g., 'minimal', 'tensorflow')
+        # The shell script uses the last part of the path-like notebook_id.
+        try:
+            scope = notebook_identity_parts[-1]
+        except IndexError:
+            # codeserver doesn't have scope
+            scope = ""
     if "-" in scope:
         assert path_parts[start_index] == "runtimes", "this naming pattern only appears in rocm runtime images"
         scope = scope.split("-", 1)[-1]
@@ -114,11 +121,12 @@ def extract_metadata_from_path(directory: Path) -> NotebookMetadata:
         accelerator_flavor = "rocm"
     elif "cuda" in notebook_identity_parts:
         accelerator_flavor = "cuda"
-    # The shell script has an implicit rule for pytorch being cuda. We can
-    # replicate this by checking for a specific Dockerfile.
-    elif (directory / "Dockerfile.cuda").exists():
+    # jupyter/pytorch has no "cuda" in the path; papermill treats jupyter-pytorch-* as cuda
+    # via name matching (_get_accelerator_flavor in test_jupyter_with_papermill.sh).
+    # When inferring from a directory path, detect cuda/rocm from Dockerfile.konflux.* variants.
+    elif (directory / "Dockerfile.konflux.cuda").exists():
         accelerator_flavor = "cuda"
-    elif (directory / "Dockerfile.rocm").exists():
+    elif (directory / "Dockerfile.konflux.rocm").exists():
         accelerator_flavor = "rocm"
 
     return NotebookMetadata(
@@ -132,7 +140,7 @@ def extract_metadata_from_path(directory: Path) -> NotebookMetadata:
 
 
 def get_source_of_truth_filepath(
-    root_repo_directory: Path,
+    manifests_directory: Path,
     metadata: NotebookMetadata,
 ) -> Path:
     """
@@ -140,7 +148,7 @@ def get_source_of_truth_filepath(
     This is a Python conversion of the shell function `_get_source_of_truth_filepath`.
 
     Returns:
-        The absolute path to the imagestream manifest file.
+        The path to the imagestream manifest file, relative to manifests_directory.
 
     Raises:
         ValueError: If the logic cannot determine the filename for the given inputs.
@@ -154,16 +162,16 @@ def get_source_of_truth_filepath(
     else:
         file_suffix = "notebook-imagestream.yaml"
 
-    manifest_directory = root_repo_directory / "manifests"
-    imagestream_directory = manifest_directory / "base"
-
     filename = ""
 
     if "runtime" == notebook_id:
-        accelerator_prefix = f"{accelerator_flavor}-" if accelerator_flavor else ""
-        filename = f"jupyter-{accelerator_prefix}{scope}-{file_suffix}"
-        if accelerator_flavor == "cuda":
-            filename = f"jupyter-{scope}-{file_suffix}"
+        if scope == JUPYTER_BASELINE_NOTEBOOK_ID:
+            filename = "runtime-baseline-imagestream.yaml"
+        else:
+            accelerator_prefix = f"{accelerator_flavor}-" if accelerator_flavor else ""
+            filename = f"jupyter-{accelerator_prefix}{scope}-{file_suffix}"
+            if accelerator_flavor == "cuda":
+                filename = f"jupyter-{scope}-{file_suffix}"
 
     elif "jupyter" in notebook_id:
         if scope == JUPYTER_MINIMAL_NOTEBOOK_ID:
@@ -177,6 +185,9 @@ def get_source_of_truth_filepath(
             # Logic for datascience and trustyai
             filename = f"jupyter-{scope}-{file_suffix}"
 
+        elif scope == JUPYTER_BASELINE_NOTEBOOK_ID:
+            filename = f"jupyter-baseline-{file_suffix}"
+
         elif JUPYTER_PYTORCH_NOTEBOOK_ID in scope or JUPYTER_TENSORFLOW_NOTEBOOK_ID in scope:
             # Logic for pytorch and tensorflow
             accelerator_prefix = f"{accelerator_flavor}-" if accelerator_flavor else ""
@@ -185,40 +196,19 @@ def get_source_of_truth_filepath(
                 # This override is intentionally different from the 'minimal' one, as per the script
                 filename = f"jupyter-{scope}-{file_suffix}"
 
-    elif CODESERVER_NOTEBOOK_ID in notebook_id:
-        filename = f"code-server-{file_suffix}"
-
-    elif RSTUDIO_NOTEBOOK_ID in notebook_id:
-        imagestream_filename = f"rstudio-gpu-{file_suffix}"
-        buildconfig_filename = "cuda-rstudio-buildconfig.yaml"
-        _ = imagestream_filename
-        filename = buildconfig_filename
+    elif CODESERVER_NOTEBOOK_ID in notebook_id or notebook_id == "codeserver-baseline":
+        if notebook_id == "codeserver-baseline" or scope == JUPYTER_BASELINE_NOTEBOOK_ID:
+            filename = f"code-server-baseline-{file_suffix}"
+        else:
+            filename = f"code-server-{file_suffix}"
 
     if not filename:
         raise ValueError(f"Unable to determine imagestream filename for '{metadata=}'")
 
-    filepath = imagestream_directory / filename
-
-    return filepath
+    return manifests_directory / "base" / filename
 
 
 class TestManifests:
-    def test_rstudio_path(self):
-        metadata = extract_metadata_from_path(Path("notebooks/rstudio/rhel9-python-3.11"))
-        assert metadata == NotebookMetadata(
-            type=NotebookType.WORKBENCH,
-            feature="rstudio",
-            scope="",
-            os_flavor="rhel9",
-            python_flavor="python-3.11",
-            accelerator_flavor=None,
-        )
-
-    def test_rstudio_truth_manifest(self):
-        metadata = extract_metadata_from_path(Path("notebooks/rstudio/rhel9-python-3.11"))
-        path = get_source_of_truth_filepath(root_repo_directory=Path("notebooks"), metadata=metadata)
-        assert path == Path("notebooks/manifests/base/cuda-rstudio-buildconfig.yaml")
-
     def test_jupyter_path(self):
         metadata = extract_metadata_from_path(Path("notebooks/jupyter/rocm/tensorflow/ubi9-python-3.12"))
         assert metadata == NotebookMetadata(
@@ -243,8 +233,8 @@ class TestManifests:
 
     def test_codeserver_path(self):
         metadata = extract_metadata_from_path(Path("notebooks/codeserver/ubi9-python-3.12"))
-        path = get_source_of_truth_filepath(root_repo_directory=Path("notebooks"), metadata=metadata)
-        assert path == Path("notebooks/manifests/base/code-server-notebook-imagestream.yaml")
+        path = get_source_of_truth_filepath(manifests_directory=_TEST_MANIFESTS_ODH_DIR, metadata=metadata)
+        assert path == _TEST_MANIFESTS_ODH_DIR / "base" / "code-server-notebook-imagestream.yaml"
 
     def test_runtime_pytorch_path(self):
         metadata = extract_metadata_from_path(
@@ -264,13 +254,13 @@ class TestManifests:
         metadata = extract_metadata_from_path(
             Path("/Users/jdanek/IdeaProjects/notebooks/runtimes/rocm-tensorflow/ubi9-python-3.12")
         )
-        path = get_source_of_truth_filepath(root_repo_directory=Path("notebooks"), metadata=metadata)
-        assert path == Path("notebooks/manifests/base/jupyter-rocm-tensorflow-notebook-imagestream.yaml")
+        path = get_source_of_truth_filepath(manifests_directory=_TEST_MANIFESTS_ODH_DIR, metadata=metadata)
+        assert path == _TEST_MANIFESTS_ODH_DIR / "base" / "jupyter-rocm-tensorflow-notebook-imagestream.yaml"
 
     def test_source_of_truth_jupyter_tensorflow_rocm(self):
         metadata = extract_metadata_from_path(Path("notebooks/jupyter/rocm/tensorflow/ubi9-python-3.12"))
-        path = get_source_of_truth_filepath(root_repo_directory=Path("notebooks"), metadata=metadata)
-        assert path == Path("notebooks/manifests/base/jupyter-rocm-tensorflow-notebook-imagestream.yaml")
+        path = get_source_of_truth_filepath(manifests_directory=_TEST_MANIFESTS_ODH_DIR, metadata=metadata)
+        assert path == _TEST_MANIFESTS_ODH_DIR / "base" / "jupyter-rocm-tensorflow-notebook-imagestream.yaml"
 
     def run_shell_function(
         self,
@@ -299,56 +289,75 @@ class TestManifests:
     def get_targets() -> Generator[tuple[str, Path]]:
         # TODO(jdanek): should systematize import paths to avoid this hack
         sys.path.insert(0, str(ROOT_DIR / "ci/cached-builds"))
-        from ci.cached_builds import gen_gha_matrix_jobs  # noqa: PLC0415
+        from ci.cached_builds import gen_gha_matrix_jobs  # ruff: ignore[import-outside-top-level]
 
-        python_311 = gen_gha_matrix_jobs.extract_image_targets(ROOT_DIR, env={"RELEASE_PYTHON_VERSION": "3.11"})
         python_312 = gen_gha_matrix_jobs.extract_image_targets(ROOT_DIR, env={"RELEASE_PYTHON_VERSION": "3.12"})
-        targets = python_311 + python_312
+        targets = python_312
         # TODO(jdanek): this is again duplicating knowledge, but, what can I do?
         expected_manifest_paths = {
-            "jupyter-minimal-ubi9-python-3.12": ROOT_DIR / "manifests/base/jupyter-minimal-notebook-imagestream.yaml",
-            "runtime-minimal-ubi9-python-3.12": ROOT_DIR / "manifests/base/jupyter-minimal-notebook-imagestream.yaml",
+            "jupyter-minimal-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-minimal-notebook-imagestream.yaml",
+            "runtime-minimal-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-minimal-notebook-imagestream.yaml",
             # no -gpu-?
-            "cuda-jupyter-minimal-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-minimal-gpu-notebook-imagestream.yaml",
-            "rocm-jupyter-minimal-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-rocm-minimal-notebook-imagestream.yaml",
-            "jupyter-datascience-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-datascience-notebook-imagestream.yaml",
-            "runtime-datascience-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-datascience-notebook-imagestream.yaml",
-            "cuda-jupyter-pytorch-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-pytorch-notebook-imagestream.yaml",
-            "runtime-cuda-pytorch-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-pytorch-notebook-imagestream.yaml",
-            "rocm-jupyter-pytorch-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-rocm-pytorch-notebook-imagestream.yaml",
-            "rocm-runtime-pytorch-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-rocm-pytorch-notebook-imagestream.yaml",
-            "cuda-jupyter-pytorch-llmcompressor-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-pytorch-notebook-imagestream.yaml",
-            "runtime-cuda-pytorch-llmcompressor-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-pytorch-notebook-imagestream.yaml",
-            "cuda-jupyter-tensorflow-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-tensorflow-notebook-imagestream.yaml",
-            "runtime-cuda-tensorflow-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-tensorflow-notebook-imagestream.yaml",
-            "rocm-jupyter-tensorflow-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-rocm-tensorflow-notebook-imagestream.yaml",
-            "rocm-runtime-tensorflow-ubi9-python-3.12": ROOT_DIR
-            / "manifests/base/jupyter-rocm-tensorflow-notebook-imagestream.yaml",
-            "jupyter-trustyai-ubi9-python-3.12": ROOT_DIR / "manifests/base/jupyter-trustyai-notebook-imagestream.yaml",
-            "codeserver-ubi9-python-3.12": ROOT_DIR / "manifests/base/code-server-notebook-imagestream.yaml",
-            "rstudio-ubi9-python-3.11": ROOT_DIR / "manifests/base/rstudio-buildconfig.yaml",
-            "rstudio-c9s-python-3.11": ROOT_DIR / "manifests/base/rstudio-buildconfig.yaml",
-            "cuda-rstudio-c9s-python-3.11": ROOT_DIR / "manifests/base/cuda-rstudio-buildconfig.yaml",
-            "rstudio-rhel9-python-3.11": ROOT_DIR / "manifests/base/rstudio-buildconfig.yaml",
-            "cuda-rstudio-rhel9-python-3.11": ROOT_DIR / "manifests/base/cuda-rstudio-buildconfig.yaml",
+            "cuda-jupyter-minimal-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-minimal-gpu-notebook-imagestream.yaml",
+            "rocm-jupyter-minimal-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-rocm-minimal-notebook-imagestream.yaml",
+            "jupyter-datascience-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-datascience-notebook-imagestream.yaml",
+            "jupyter-baseline-c9s-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-baseline-notebook-imagestream.yaml",
+            "runtime-baseline-c9s-python-3.12": MANIFESTS_ODH_DIR / "base" / "runtime-baseline-imagestream.yaml",
+            "runtime-datascience-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-datascience-notebook-imagestream.yaml",
+            "cuda-jupyter-pytorch-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-pytorch-notebook-imagestream.yaml",
+            "runtime-cuda-pytorch-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-pytorch-notebook-imagestream.yaml",
+            "rocm-jupyter-pytorch-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-rocm-pytorch-notebook-imagestream.yaml",
+            "rocm-runtime-pytorch-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-rocm-pytorch-notebook-imagestream.yaml",
+            "cuda-jupyter-pytorch-llmcompressor-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-pytorch-notebook-imagestream.yaml",
+            "runtime-cuda-pytorch-llmcompressor-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-pytorch-notebook-imagestream.yaml",
+            "cuda-jupyter-tensorflow-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-tensorflow-notebook-imagestream.yaml",
+            "runtime-cuda-tensorflow-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-tensorflow-notebook-imagestream.yaml",
+            "rocm-jupyter-tensorflow-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-rocm-tensorflow-notebook-imagestream.yaml",
+            "rocm-runtime-tensorflow-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-rocm-tensorflow-notebook-imagestream.yaml",
+            "jupyter-trustyai-ubi9-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "jupyter-trustyai-notebook-imagestream.yaml",
+            "codeserver-ubi9-python-3.12": MANIFESTS_ODH_DIR / "base" / "code-server-notebook-imagestream.yaml",
+            "codeserver-baseline-c9s-python-3.12": MANIFESTS_ODH_DIR
+            / "base"
+            / "code-server-baseline-notebook-imagestream.yaml",
         }
         for target in targets:
-            if "codeserver" in target:
-                continue
-            if "rstudio" in target:
+            if "codeserver" in target and "baseline" not in target:
                 continue
             try:
                 expected_manifest_path = expected_manifest_paths[target]

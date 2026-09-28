@@ -7,19 +7,23 @@ on:  # yamllint disable-line rule:truthy
 jobs:
   add-to-project:
     name: Add issue to projects
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - name: Generate github-app token
         id: app-token
-        uses: getsentry/action-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
         with:
-          app_id: ${{ secrets.DEVOPS_APP_ID }}
-          private_key: ${{ secrets.DEVOPS_APP_PRIVATE_KEY }}
-      - uses: actions/add-to-project@v1
+          app-id: ${{ secrets.DEVOPS_APP_ID }}
+          private-key: ${{ secrets.DEVOPS_APP_PRIVATE_KEY }}
+          owner: opendatahub-io
+          repositories: notebooks
+          permission-organization-projects: write
+          permission-issues: read  # add-to-project reads the triggering issue; no PR permission needed since this workflow only fires on issues: opened
+      - uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd  # v2.0.0
         with:
           project-url: https://github.com/orgs/opendatahub-io/projects/40
           github-token: ${{ steps.app-token.outputs.token }}
-      - uses: actions/add-to-project@v1
+      - uses: actions/add-to-project@5afcf98fcd03f1c2f92c3c83f58ae24323cc57fd  # v2.0.0
         with:
           project-url: https://github.com/orgs/opendatahub-io/projects/45
           github-token: ${{ steps.app-token.outputs.token }}

@@ -8,25 +8,30 @@ name: Test Trivy Scan Action
       - '.github/workflows/test-trivy-scan-action.yaml'
       - 'ci/trivy-markdown.tpl'
   push:
+    branches: [main, stable, 'rhoai-*']
     paths:
       - '.github/actions/trivy-scan-action/**'
       - '.github/workflows/test-trivy-scan-action.yaml'
       - 'ci/trivy-markdown.tpl'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-scan-type-image:
     name: Test Image Scan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     env:
       # random image from our past, don't update it all the time
       TEST_IMAGE: quay.io/opendatahub/odh-pipeline-runtime-minimal-cpu-py312-ubi9:2025b-v1.40
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Install missing dependencies
+      - name: Detect missing dependencies
+        id: detect-packages
         run: |
-          # Collect missing packages
           PACKAGES=()
           if ! command -v podman &> /dev/null; then
             PACKAGES+=(podman)
@@ -34,13 +39,13 @@ jobs:
           if ! command -v setfacl &> /dev/null; then
             PACKAGES+=(acl)
           fi
+          echo "packages=${PACKAGES[*]}" >> "$GITHUB_OUTPUT"
 
-          # Install missing packages if any
-          if [ ${#PACKAGES[@]} -gt 0 ]; then
-            echo "Installing missing packages: ${PACKAGES[*]}"
-            sudo apt-get update
-            sudo apt-get install -y "${PACKAGES[@]}"
-          fi
+      - name: Install missing dependencies
+        if: steps.detect-packages.outputs.packages != ''
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ${{ steps.detect-packages.outputs.packages }}
 
       - name: Configure Podman
         run: |
@@ -81,10 +86,10 @@ jobs:
 
   test-scan-type-fs:
     name: Test FS scan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Test Trivy scan on filesystem
         uses: ./.github/actions/trivy-scan-action

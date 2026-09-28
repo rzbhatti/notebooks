@@ -11,7 +11,7 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/cancel-in-progress: 'true'
     pipelinesascode.tekton.dev/max-keep-runs: '3'
-    pipelinesascode.tekton.dev/on-comment: ^/kfbuild\s+(all|odh\-pipeline\-runtime\-pytorch\-rocm\-py312\-ubi9|runtimes/rocm\-pytorch/ubi9\-python\-3\.12)
+    pipelinesascode.tekton.dev/on-comment: ^/(kfbuild\-all|build\-konflux|build\-runtime\-pytorch\-rocm)
     pipelinesascode.tekton.dev/on-cel-expression: |
       event == "pull_request" && target_branch == "main" && !("manifests/base/params-latest.env".pathChanged()) && (".tekton/odh-pipeline-runtime-pytorch-rocm-py312-ubi9-pull-request.yaml".pathChanged() || "runtimes/rocm-pytorch/ubi9-python-3.12/**".pathChanged() || "runtimes/rocm-pytorch/ubi9-python-3.12/build-args/rocm.conf".pathChanged() )
       && body.repository.full_name == "opendatahub-io/notebooks"
@@ -25,8 +25,6 @@ spec:
   timeouts:
     pipeline: 6h
   params:
-  - name: event-type
-    value: '{{event_type}}'
   - name: git-url
     value: '{{source_url}}'
   - name: revision
@@ -37,19 +35,102 @@ spec:
     value: 5d
   - name: build-platforms
     value:
-    - linux-d160-m2xlarge/amd64
+    - linux/x86_64
   - name: dockerfile
-    value: runtimes/rocm-pytorch/ubi9-python-3.12/Dockerfile.rocm
+    value: runtimes/rocm-pytorch/ubi9-python-3.12/Dockerfile.konflux.rocm
   - name: path-context
     value: .
+  - name: event-type
+    value: '{{event_type}}'
   - name: build-args-file
     value: runtimes/rocm-pytorch/ubi9-python-3.12/build-args/rocm.conf
+  - name: hermetic
+    value: 'true'
+  - name: prefetch-input
+    value:
+    - path: prefetch-input/odh
+      type: rpm
+    - path: prefetch-input/odh
+      type: generic
+    - path: runtimes/rocm-pytorch/ubi9-python-3.12
+      type: pip
+      binary:
+        arch: x86_64
+      requirements_files: [requirements.rocm.txt]
+  taskRunSpecs:
+  - pipelineTaskName: prefetch-dependencies
+    computeResources:
+      requests:
+        cpu: '4'
+        memory: 8Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+  - pipelineTaskName: build-images
+    stepSpecs:
+    - name: prepare-sboms
+      computeResources:
+        requests:
+          cpu: '4'
+          memory: 8Gi
+        limits:
+          cpu: '4'
+          memory: 8Gi
+    - name: build
+      computeResources:
+        requests:
+          cpu: '4'
+          memory: 8Gi
+          ephemeral-storage: 80Gi
+        limits:
+          cpu: '4'
+          memory: 8Gi
+          ephemeral-storage: 80Gi
+  - pipelineTaskName: clair-scan
+    computeResources:
+      requests:
+        cpu: '8'
+        memory: 8Gi
+      limits:
+        cpu: '8'
+        memory: 8Gi
+  - pipelineTaskName: ecosystem-cert-preflight-checks
+    computeResources:
+      requests:
+        cpu: '4'
+        memory: 8Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+  - pipelineTaskName: sast-shell-check
+    computeResources:
+      requests:
+        cpu: '4'
+        memory: 8Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+  - pipelineTaskName: sast-unicode-check
+    computeResources:
+      requests:
+        cpu: '4'
+        memory: 8Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+  - pipelineTaskName: clamav-scan
+    computeResources:
+      limits:
+        memory: 8Gi
+  - pipelineTaskName: rpms-signature-scan
+    computeResources:
+      limits:
+        memory: 8Gi
   pipelineRef:
-    name: multiarch-combined-pipeline
+    name: multiarch-odh-main-combined-pipeline
   taskRunTemplate:
     serviceAccountName: build-pipeline-odh-pipeline-runtime-pytorch-rocm-py312-ubi9
   workspaces:
   - name: git-auth
     secret:
       secretName: '{{ git_auth_secret }}'
-status: {}

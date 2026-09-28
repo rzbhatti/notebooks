@@ -9,6 +9,7 @@ labels: 'kind/bug'
 
 
 **What did you expect to happen:**
+[Describe the expected behavior.]
 
 
 **Anything else you would like to add:**
@@ -20,7 +21,8 @@ labels: 'kind/bug'
 - OpenDatahub Version: (please check the operator version)
 - Workbench: (all, data-science, etc)
 - Workbench Version: (2023.1, etc)
-- Specific tool: (jupyterlab, rstudio server, code-server, elyra-pipelines,etc)
+- Workbench Image Digest: (run `podman inspect <image> | grep -i digest` or check the workbench deployment)
+- Specific tool: (jupyterlab, code-server, elyra-pipelines, etc.)
 - Notebook-Controller Version: (please check the image version in notebook-controller deployment)
 
 **Logs/Screenshots**

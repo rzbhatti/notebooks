@@ -3,26 +3,62 @@ name: Test Playwright Action
 "on":
   workflow_dispatch:
   pull_request:
-    paths:
+    paths: &playwright-action-paths
       - '.github/actions/playwright-test/**'
       - '.github/workflows/test-playwright-action.yaml'
       - 'tests/browser/**'
+      - '.github/workflows/build-browser-tests.yaml'
   push:
-    paths:
-      - '.github/actions/playwright-test/**'
-      - '.github/workflows/test-playwright-action.yaml'
-      - 'tests/browser/**'
+    branches: [main, stable, 'rhoai-*']
+    paths: *playwright-action-paths
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    name: Lint & Typecheck
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Read pnpm version from lockfile
+        id: pnpm-ver
+        run: |
+          ver=$(scripts/get-pnpm-version.sh tests/browser/pnpm-lock.yaml)
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86  # v6.0.10
+        with:
+          version: ${{ steps.pnpm-ver.outputs.version }}
+          cache: true
+          cache_dependency_path: tests/browser/pnpm-lock.yaml
+          # language=yaml
+          run_install: |
+            - cwd: tests/browser
+              args: [--frozen-lockfile]
+
+      - run: pnpm typecheck && pnpm lint
+        working-directory: tests/browser
+
   test-playwright:
     name: Test Playwright Browser Tests
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: read
     env:
       # Use rootful podman socket so podman run can find the image pulled with sudo
       CONTAINER_HOST: unix:///var/run/podman/podman.sock
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
 
       - name: Extract default test image from playwright.config.ts
         id: get-image
@@ -46,9 +82,9 @@ jobs:
           echo "image=$TEST_IMAGE" >> "$GITHUB_OUTPUT"
           echo "Using test image: $TEST_IMAGE"
 
-      - name: Install missing dependencies
+      - name: Detect missing dependencies
+        id: detect-packages
         run: |
-          # Collect missing packages
           PACKAGES=()
           if ! command -v podman &> /dev/null; then
             PACKAGES+=(podman)
@@ -56,13 +92,13 @@ jobs:
           if ! command -v setfacl &> /dev/null; then
             PACKAGES+=(acl)
           fi
+          echo "packages=${PACKAGES[*]}" >> "$GITHUB_OUTPUT"
 
-          # Install missing packages if any
-          if [ ${#PACKAGES[@]} -gt 0 ]; then
-            echo "Installing missing packages: ${PACKAGES[*]}"
-            sudo apt-get update
-            sudo apt-get install -y "${PACKAGES[@]}"
-          fi
+      - name: Install missing dependencies
+        if: steps.detect-packages.outputs.packages != ''
+        uses: ./.github/actions/apt-install
+        with:
+          packages: ${{ steps.detect-packages.outputs.packages }}
 
       - name: Configure Podman
         run: |
@@ -85,10 +121,26 @@ jobs:
         env:
           TEST_IMAGE: ${{ steps.get-image.outputs.image }}
 
+      - name: Build browser tests image
+        id: browser-tests-image
+        run: |
+          set -Eeuxo pipefail
+          IMAGE="localhost/workbench-images-tests:ci"
+          PLAYWRIGHT_VERSION=$(uv run python scripts/get_playwright_version.py tests/browser/package.json5)
+          podman build \
+            --build-arg "PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION}" \
+            -t "${IMAGE}" \
+            -f tests/browser/Dockerfile \
+            tests/browser
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
       - name: Run Playwright tests
         uses: ./.github/actions/playwright-test
         with:
           test-target: ${{ steps.get-image.outputs.image }}
+          playwright-image: ${{ steps.browser-tests-image.outputs.image }}
           podman-socket: /var/run/podman/podman.sock
           upload-report: 'true'
           artifact-name: playwright-action-test-report
+          junit-artifact-file: playwright-action-test-junit.xml
+          grep-pattern: '@codeserver'

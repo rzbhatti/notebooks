@@ -14,9 +14,9 @@ For a deeper understanding of the architecture underlying this repository, pleas
 ### Prerequisites
 Make sure the following tools are installed in your environment:
  - podman/docker
- - python
- - pipenv
- - make (on macOS install/use: gmake)
+ - python 3.14
+ - [uv](https://docs.astral.sh/uv/)
+ - make (on macOS: `brew install make` and add `/opt/homebrew/opt/make/libexec/gnubin` to `PATH`)
  - curl
  - git, git-lfs (for `*.vsix` files)
 
@@ -42,6 +42,10 @@ Using  `IMAGE_REGISTRY` and `RELEASE` variables you can overwrite the default va
 
 Using `CONTAINER_BUILD_CACHE_ARGS` (default: `--no-cache`), and `PUSH_IMAGES` variables you can further customize the build process.
 
+### Hermetic prefetch (`prefetch-input/`)
+
+Jupyter images that build **hermetically** (Konflux and local builds with Cachi2) share **repo-root** [`prefetch-input/`](prefetch-input/README.md): RPM lock inputs (`odh/`, `rhds/`), `repos/`, and the **mongocli** submodule. Each hermetic image directory under `jupyter/*/ubi9-python-3.12/` contains a **symlink** `prefetch-input` → `../../../prefetch-input`. **Code-server** keeps its own `codeserver/ubi9-python-3.12/prefetch-input/` (different dependency set). To prefetch dependencies locally, see [`scripts/lockfile-generators/README.md`](scripts/lockfile-generators/README.md).
+
 ### Local Execution
 
 The notebook can be run as container on the local systems.
@@ -52,35 +56,148 @@ Use podman/docker to execute the workbench images as container.
 podman  run -it -p  8888:8888  quay.io/opendatahub/workbench-images:jupyter-minimal-ubi9-python-3.9-2024a-20240317-6f4c36b
 ```
 
-### Pipfile.lock Generation
+### Lock file generation
 
-Users can update Pipfile.lock files using the [piplock-renewal.yaml](https://github.com/opendatahub-io/notebooks/blob/main/.github/workflows/piplock-renewal.yaml) GitHub Action. This workflow enables users to specify a target branch for updating and automerging Pipfile.lock files, select the desired Python version for the update as well as to choose whether to include optional directories in the update process. After the action completes, the updated files can be retrieved with a simple git pull.
+Image lock files (`pylock.toml` / `uv.lock.d/`) are regenerated with `make refresh-lock-files`.
+For details on the dual `uv` version policy (dev vs image locks), see the
+[Deploy & Test](#deploy--test) section below.
 
-Note: To ensure the GitHub Action runs successfully, users must add a `GH_ACCESS_TOKEN` secret in their fork.
+### Update base image versions
+
+Use the root [`versions_config.yml`](versions_config.yml) file as the operator
+entry point for base image updates.
+
+The sync flow validates that config, rewrites managed `build-args/*.conf`
+`BASE_IMAGE` and `RELEASE` values, updates root `Makefile` `RELEASE` defaults,
+and resolves RHDS `channel: fast` tags from published Quay tags with `skopeo`.
+
+For the full configuration contract, RHDS and ODH resolution rules, Mermaid flow
+diagram, and worked examples, see
+[`docs/base_image_versions_update_configuration.md`](docs/base_image_versions_update_configuration.md).
+
+Quick commands:
+
+```shell
+make sync-build-args-from-versions
+make sync-build-args-from-versions SYNC_BUILD_ARGS_ARGS=--dry-run
+make sync-build-args-from-versions SYNC_BUILD_ARGS_ARGS=--check
+```
+
+If the version update also requires lockfile refreshes, run
+`make refresh-lock-files` after the sync.
+
+### Kick off a new release (maintainers)
+
+Use this flow when starting a **new release stream** (for example, `3.5` → `3.6`).
+For mid-release image bumps only, use `make sync-build-args-from-versions` instead
+(see above).
+
+1. Update [`versions_config.yml`](versions_config.yml) (`release.full_version` and any
+   preferred base-image settings).
+2. Run the orchestrated kickoff recipe locally **or** via GitHub Actions.
+
+The kickoff recipe runs these steps in order:
+
+1. `make sync-build-args-from-versions`
+2. `make refresh-lock-files` (with `FORCE_LOCKFILES_UPGRADE=1`)
+3. Generate ODH RPM lockfile (root prefetch input)
+4. Generate ODH RPM lockfile (codeserver prefetch input)
+5. Generate RHDS RPM lockfile (root prefetch input)
+6. Generate RHDS RPM lockfile (codeserver prefetch input)
+7. Roll out imagestream tags (`manifests/tools/rollout_tag_on_imagestreams.py`)
+8. Validate with `make test`
+
+#### Local kickoff
+
+Export RHDS subscription credentials once per shell session, then run kickoff:
+
+```shell
+export SUBSCRIPTION_ACTIVATION_KEY='...'
+export SUBSCRIPTION_ORG='...'
+gmake kickoff-release
+```
+
+If a step fails, rerun the same command to auto-resume from
+`.kickoff-release.state`, or force a step:
+
+```shell
+gmake kickoff-release KICKOFF_START_STEP=5
+```
+
+To clear cached RPM lockfile generator images between ODH/RHDS phases manually:
+
+```shell
+gmake clean-rpm-lockfile-cache
+```
+
+#### GitHub Actions kickoff
+
+On `opendatahub-io/notebooks`, run **Actions → Release Kickoff Action → Run workflow**.
+
+Optional workflow inputs:
+
+- `release_full_version`, `release_rhds_os_base`, `release_python_version`
+- `versions_overrides` (`dot.path=value`, one per line), for example:
+
+```text
+artifacts.base_image.cuda.tensorflow.acc_version=13.0
+artifacts.base_image.cpu.rhds.channel=fast
+artifacts.base_image.rocm.pytorch.rhds.channel=stable
+```
+
+The workflow applies overrides, runs `make kickoff-release`, and opens a PR titled
+`GHA: Kick off new release <full_version>`.
+
+Required repository secrets: `GIT_CRYPT_KEY`, `SUBSCRIPTION_ACTIVATION_KEY`,
+`SUBSCRIPTION_ORG`, `GH_ACCESS_TOKEN`.
 
 ### Deploy & Test
 
 #### Prepare Python + uv + pytest env
 
+Root dev tooling uses `[tool.uv] required-version` in `pyproject.toml` (currently `>=0.11.8,<0.13`).
+Install any uv in that range and use it directly for sync, tests, and pre-commit:
+
 ```shell
 # Linux
 sudo dnf install python3.14
-pip install --user uv
-# MacOS
+pip install --user 'uv>=0.11.8,<0.13'
+# macOS
 brew install python@3.14 uv
 
 uv venv --python $(which python3.14)
 uv sync --locked
 ```
 
-#### Running Python selftests in Pytest
-By completing configuration in previous section, you are able to run any tests that don't need to start a container using following command:
+Per-image lock files (`pylock.toml` / `uv.lock.d/`) are generated with a **stricter** uv pin
+(`dependencies/uv-image-lock-version`, currently `0.12.0`) via the `./uv` wrapper and
+`make refresh-lock-files`. Do not use `./uv` for everyday dev commands unless you are
+refreshing image locks.
 
-```
-make test
+<details>
+<summary>Image lock generation with <code>./uv</code></summary>
+
+```shell
+make refresh-lock-files
+# or: ./uv run scripts/pylocks_generator.py public-index <dir>
 ```
 
-Use `gmake test` if you're on macOS.
+The `./uv` script runs `uv tool run "uv@$(cat dependencies/uv-image-lock-version)"` when your
+system uv does not already match that exact version.
+
+</details>
+
+#### Running tests
+
+For the full test catalog (types, markers, CI parity), see [docs/agents/testing.md](docs/agents/testing.md).
+
+By completing configuration in the previous section, you can run tests using the following targets:
+
+```bash
+make test              # Quick static tests (pytest + Dockerfile alignment check)
+make test-unit         # Python unit tests + doctests + Go tests (no container runtime needed)
+make test-integration PYTEST_ARGS="--image=<image>"  # Container integration tests
+```
 
 ##### Container selftests
 
@@ -99,7 +216,7 @@ In addition, Dagger [does not allow bind-mounting local directories](https://doc
 to the container but always copies files in and out.
 
 #### Running testcontainers tests in Pytest
-```
+```bash
 # Podman/Docker config
 # Linux
 sudo dnf install podman
@@ -189,12 +306,10 @@ This table provides a concise overview of the support status for various contain
 | CPU DataScience | - | 3.12 | UBI9 | ✅ | ✅ | ✅ | ✅ | [quay.io/repository/opendatahub/odh-workbench-jupyter-datascience-cpu-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-datascience-cpu-py312-ubi9?tab=tags) |
 | CPU TrustyAI | - | 3.12 | UBI9 | ✅ | ✅ | ✅ | ✅ | [quay.io/repository/opendatahub/odh-workbench-jupyter-trustyai-cpu-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-trustyai-cpu-py312-ubi9?tab=tags) |
 | CPU CodeServer | - | 3.12 | UBI9 | ✅ | ✅ | ✅ | ✅ | [quay.io/repository/opendatahub/odh-workbench-codeserver-datascience-cpu-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-codeserver-datascience-cpu-py312-ubi9?tab=tags) |
-| CPU RStudio | - | 3.12 | C9S | ✅ | ✅ | - | - | [quay.io/repository/opendatahub/odh-workbench-rstudio-minimal-cpu-py312-c9s](https://quay.io/repository/opendatahub/odh-workbench-rstudio-minimal-cpu-py312-c9s?tab=tags) |
 | CUDA Minimal | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-minimal-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-minimal-cuda-py312-ubi9?tab=tags) |
-| CUDA PyTorch | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ⏰ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-cuda-py312-ubi9?tab=tags) |
-| CUDA PyTorch LLMCompressor | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ⏰ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-llmcompressor-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-llmcompressor-cuda-py312-ubi9?tab=tags) |
+| CUDA PyTorch | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-cuda-py312-ubi9?tab=tags) |
+| CUDA PyTorch LLMCompressor | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-llmcompressor-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-llmcompressor-cuda-py312-ubi9?tab=tags) |
 | CUDA TensorFlow | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-tensorflow-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-tensorflow-cuda-py312-ubi9?tab=tags) |
-| CUDA RStudio | 12.8 | 3.12 | C9S | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-rstudio-minimal-cuda-py312-c9s](https://quay.io/repository/opendatahub/odh-workbench-rstudio-minimal-cuda-py312-c9s?tab=tags) |
 | ROCM Minimal | 6.3 | 3.12 | UBI9/RHEL9.6 | ✅ | ❌ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-minimal-rocm-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-minimal-rocm-py312-ubi9) |
 | ROCM PyTorch | 6.3 | 3.12 | UBI9/RHEL9.6 | ✅ | ❌ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-rocm-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-pytorch-rocm-py312-ubi9?tab=tags) |
 | ROCM TensorFlow | 6.3 | 3.12 | UBI9/RHEL9.6 | ✅ | ❌ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-workbench-jupyter-tensorflow-rocm-py312-ubi9](https://quay.io/repository/opendatahub/odh-workbench-jupyter-tensorflow-rocm-py312-ubi9?tab=tags) |
@@ -204,9 +319,9 @@ This table provides a concise overview of the support status for various contain
 |----------|----------|--------|------|---------|----------|----------|--------|-------------|
 | CPU Minimal | - | 3.12 | UBI9 | ✅ | ✅ | ✅ | ✅ | [quay.io/repository/opendatahub/odh-pipeline-runtime-minimal-cpu-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-minimal-cpu-py312-ubi9?tab=tags) |
 | CPU DataScience | - | 3.12 | UBI9 | ✅ | ✅ | ✅ | ✅ | [quay.io/repository/opendatahub/odh-pipeline-runtime-datascience-cpu-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-datascience-cpu-py312-ubi9?tab=tags) |
-| CUDA PyTorch | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ⏰ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-cuda-py312-ubi9?tab=tags) |
-| CUDA PyTorch LLMCompressor | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ⏰ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-llmcompressor-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-llmcompressor-cuda-py312-ubi9) |
-| CUDA TensorFlow | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ⏰ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-tensorflow-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-tensorflow-cuda-py312-ubi9?tab=tags) |
+| CUDA PyTorch | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-cuda-py312-ubi9?tab=tags) |
+| CUDA PyTorch LLMCompressor | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-llmcompressor-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-llmcompressor-cuda-py312-ubi9) |
+| CUDA TensorFlow | 12.8 | 3.12 | UBI9/RHEL9.6 | ✅ | ✅ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-tensorflow-cuda-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-tensorflow-cuda-py312-ubi9?tab=tags) |
 | ROCM PyTorch | 6.3 | 3.12 | UBI9/RHEL9.6 | ✅ | ❌ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-rocm-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-pytorch-rocm-py312-ubi9?tab=tags) |
 | ROCM TensorFlow | 6.3 | 3.12 | UBI9/RHEL9.6 | ✅ | ❌ | ❌ | ❌ | [quay.io/repository/opendatahub/odh-pipeline-runtime-tensorflow-rocm-py312-ubi9](https://quay.io/repository/opendatahub/odh-pipeline-runtime-tensorflow-rocm-py312-ubi9?tab=tags) |
 
@@ -222,7 +337,7 @@ Whether you're fixing bugs, adding new notebooks, or improving documentation, yo
 
 ### For AI Agents
 
-If you're an AI agent working with this repository, please refer to our [Agents Guide](Agents.md) for comprehensive instructions on project structure, development workflows, and best practices.
+If you're an AI agent working with this repository, please refer to our [Agents Guide](AGENTS.md) for comprehensive instructions on project structure, development workflows, and best practices.
 
 ## Acknowledgments
 

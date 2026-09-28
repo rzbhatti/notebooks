@@ -2,30 +2,25 @@
 "name": "Docs (release notes)"
 "on":
   "push":
+    branches: [main, stable, 'rhoai-*']
   "pull_request":
   "workflow_dispatch":
 
-permissions:
-  contents: read
-
-env:
-  poetry_version: '1.8.3'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   generate-releasenotes:
+    permissions:
+      contents: read
     name: Generate list of images for release notes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      # https://github.com/astral-sh/setup-uv
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          version: "latest"
-          python-version: "3.14"
-          enable-cache: true
-          cache-dependency-glob: "uv.lock"
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
 
       - name: Run the release notes script
         run: |

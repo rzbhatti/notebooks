@@ -32,10 +32,17 @@ spec:
             - name: notebook-port
               protocol: TCP
               containerPort: 8888
+          # Allow up to 90 seconds for startup on slow or constrained nodes (e.g. ppc64le in CI).
+          startupProbe:
+            tcpSocket:
+              port: notebook-port
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 9
           livenessProbe:
             tcpSocket:
               port: notebook-port
-            initialDelaySeconds: 5
+            initialDelaySeconds: 0
             periodSeconds: 5
             successThreshold: 1
             failureThreshold: 3

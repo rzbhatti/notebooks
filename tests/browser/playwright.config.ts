@@ -1,5 +1,6 @@
 import { defineConfig, devices } from '@playwright/test';
 import * as process from "node:process";
+import {CodeServerSource, ConfigFixtures} from "./tests/fixtures";
 
 // Default test image used when TEST_TARGET env var is not set.
 // WARNING: This value is parsed by .github/workflows/test-playwright-action.yaml via grep.
@@ -9,7 +10,7 @@ export const DEFAULT_TEST_IMAGE = "quay.io/modh/codeserver:codeserver-ubi9-pytho
 /**
  * See https://playwright.dev/docs/test-configuration.
  */
-export default defineConfig({
+export default defineConfig<ConfigFixtures>({
   testDir: './tests',
   /* Run tests in files in parallel */
   fullyParallel: true,
@@ -20,12 +21,24 @@ export default defineConfig({
   /* Opt out of parallel tests on CI. */
   workers: process.env.CI ? 1 : 1,
   /* Reporter to use. See https://playwright.dev/docs/test-reporters */
-  reporter: [ ['html', { open: 'never' }], ['line'] ],
+  reporter: [
+    ['html', { open: 'never' }],
+    ['line'],
+    // JUnit XML is required by the shift-left CI pipeline: the pipeline archives
+    // files matching **/*unit*.xml and forwards them to Report Portal.
+    // outputFile must be inside resultsDir (/home/pwuser/tests/browser/results/).
+    ['junit', { outputFile: 'results/junit.xml' }],
+  ],
+  // Artifacts (screenshots, traces) land inside resultsDir so they are archived.
+  outputDir: 'results/playwright-output',
   /* Shared settings for all the projects below. See https://playwright.dev/docs/api/class-testoptions. */
   use: {
-    codeServerSource: {
-      image: process.env['TEST_TARGET'],
-    },
+    // Only override the fixture default when TEST_TARGET is set
+    ...(process.env['TEST_TARGET'] ? {
+      codeServerSource: CodeServerSource.image(process.env['TEST_TARGET']),
+    } : {}),
+
+    ignoreHTTPSErrors: true,
 
     /* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
     trace: 'on-first-retry',
@@ -65,12 +78,12 @@ function getProjects() {
       name: 'Google Chrome',
       use: { ...devices['Desktop Chrome'], channel: 'chrome',
         headless: false,  // the CDP browser configured below is not affected by this
+        launchOptions: { args: ['--remote-debugging-port=9222'] },
         /* custom properties, comment out as needed */
-        connectCDP: false,  // false | number: connect to an existing browser running at given port (e.g. 9222)
-        codeServerSource: {  // prefers url if specified, otherwise will start the specified docker image
-          // url: "",  // not-present | string
-          image: DEFAULT_TEST_IMAGE,  // string
-        }
+        connectCDP: false as const,  // false | number: connect to an existing browser running at given port (e.g. 9222)
+        codeServerSource:  // prefers url if specified, otherwise will start the specified docker image
+          // CodeServerSource.url(""),  // not-present | string
+          CodeServerSource.image(DEFAULT_TEST_IMAGE),  // string
       },
     }
   ]

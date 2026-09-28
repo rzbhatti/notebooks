@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import logging
 import os
 import platform
@@ -13,13 +14,35 @@ import testcontainers.core.config
 import testcontainers.core.container
 import testcontainers.core.docker_client
 
-from tests.containers import docker_utils, skopeo_utils, utils
+from tests.containers import docker_utils, skopeo_utils
 from tests.containers.kubernetes_utils import TestFrame
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
     from pytest import ExitCode, Metafunc, Parser, Session
+
+
+class WorkbenchType(enum.StrEnum):
+    JUPYTER = "jupyter"
+    CODESERVER = "codeserver"
+    CHE_CODE = "che-code"
+    OTHER = "other"
+
+    @property
+    def is_vscode(self) -> bool:
+        return self in (WorkbenchType.CODESERVER, WorkbenchType.CHE_CODE)
+
+
+def classify_workbench(label_name: str) -> WorkbenchType:
+    if "-che-code-" in label_name:
+        return WorkbenchType.CHE_CODE
+    if "-code-server-" in label_name or "-codeserver-" in label_name:
+        return WorkbenchType.CODESERVER
+    if "-jupyter-" in label_name:
+        return WorkbenchType.JUPYTER
+    return WorkbenchType.OTHER
+
 
 SECURITY_OPTION_ROOTLESS = "name=rootless"
 TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE = "TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE"
@@ -45,48 +68,94 @@ class Image:
     id: str | None
     name: str
     labels: dict[str, str]
+    # Env from image config when available (local inspect or skopeo); used when source_location is missing
+    env: dict[str, str] | None = None
+    workbench_type: WorkbenchType = WorkbenchType.OTHER
+
+    def __post_init__(self):
+        self.workbench_type = classify_workbench(self.labels.get("name", ""))
 
     @classmethod
     def from_docker(cls, image: docker.models.images.Image, name: str):
-        return Image(id=image.id, name=name, labels=image.labels)
+        # docker-py only reads attrs['Config']['Labels']. Podman's compat API sometimes
+        # returns labels in ContainerConfig only (see containers/podman#2017 and compat API).
+        # So we read from both so labels are present when running against Podman (e.g. GHA).
+        labels = _labels_from_docker_attrs(image.attrs)
+        env = _env_from_docker_attrs(image.attrs)
+        return Image(id=image.id, name=name, labels=labels, env=env)
+
+
+def _labels_from_docker_attrs(attrs: dict[str, Any]) -> dict[str, str]:
+    """Extract image labels from Docker/Podman inspect attrs. Prefer Config, fallback to ContainerConfig."""
+    for key in ("Config", "ContainerConfig"):
+        config = attrs.get(key) or {}
+        labels = config.get("Labels")
+        if isinstance(labels, dict) and labels:
+            return dict(labels)
+    return {}
+
+
+def _env_from_docker_attrs(attrs: dict[str, Any]) -> dict[str, str]:
+    """Extract env (KEY=VALUE list) from Docker/Podman inspect attrs."""
+    for key in ("Config", "ContainerConfig"):
+        config = attrs.get(key) or {}
+        env_list = config.get("Env")
+        if isinstance(env_list, list) and env_list:
+            parsed = {}
+            for item in env_list:
+                if isinstance(item, str) and "=" in item:
+                    k, v = item.split("=", 1)
+                    parsed[k] = v
+            return parsed
+    return {}
 
 
 # https://docs.pytest.org/en/latest/reference/reference.html#pytest.hookspec.pytest_addoption
 def pytest_addoption(parser: Parser) -> None:
     parser.addoption("--image", action="append", default=[], help="Image to use, can be specified multiple times")
+    parser.addoption(
+        "--no-cleanup-images",
+        action="store_true",
+        default=False,
+        help="Don't remove images pulled during manifest validation tests",
+    )
 
 
 # https://docs.pytest.org/en/latest/reference/reference.html#pytest.hookspec.pytest_generate_tests
 def pytest_generate_tests(metafunc: Metafunc) -> None:
     if image.__name__ in metafunc.fixturenames:
-        metafunc.parametrize(image.__name__, metafunc.config.getoption("--image"))
+        # scope="session" is required here to match the fixture's declared scope.
+        # Without it, metafunc.parametrize defaults to function scope and silently
+        # overrides the fixture scope (https://github.com/pytest-dev/pytest/issues/634),
+        # causing ScopeMismatch for any session-scoped fixture that depends on `image`.
+        image_option = metafunc.config.getoption("--image")
+        assert image_option is not None, "--image option must be provided"
+        metafunc.parametrize(image.__name__, image_option, scope="session")
 
 
 def get_image_metadata(image: str) -> Image:
-    client = testcontainers.core.container.DockerClient()
+    client = testcontainers.core.docker_client.DockerClient()
     try:
         # docker inspect
         image_metadata = client.client.images.get(image)
     except docker.errors.ImageNotFound:
-        # skopeo inspect
+        # skopeo inspect (may be None if skopeo not installed or inspect failed)
         image_info = skopeo_utils.get_image_info(image)
-        if image_info.labels is not None:
-            return Image(id=None, name=image, labels=image_info.labels)
+        if image_info is not None and image_info.labels is not None:
+            return Image(id=None, name=image, labels=image_info.labels, env=image_info.env or {})
         # pull & docker inspect
         image_metadata = client.client.images.pull(image)
-        assert isinstance(image_metadata, docker.models.images.Image)
+        assert isinstance(image_metadata, docker.models.images.Image), "docker images.pull() did not return an Image"
 
     return Image.from_docker(image_metadata, name=image)
 
 
 def skip_if_not_workbench_image(image: str) -> Image:
+    """Skip unless the image is JupyterLab or a VS Code workbench."""
     image_metadata = get_image_metadata(image)
 
-    ide_server_label_fragments = ("-code-server-", "-jupyter-", "-rstudio-")
-    if not any(ide in image_metadata.labels["name"] for ide in ide_server_label_fragments):
-        pytest.skip(
-            f"Image {image} does not have any of '{ide_server_label_fragments=} in {image_metadata.labels['name']=}'"
-        )
+    if image_metadata.workbench_type is WorkbenchType.OTHER:
+        pytest.skip(f"Image {image} is not a workbench (label name={image_metadata.labels.get('name')!r})")
 
     return image_metadata
 
@@ -125,7 +194,26 @@ def image(request):
     yield request.param
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
+def container_arch(image: str) -> str:
+    """Detect the CPU architecture of the container image. Runs once per session."""
+    container = testcontainers.core.container.DockerContainer(image=image, user=0)
+    container.with_command("/bin/sh -c 'sleep infinity'")
+    known_architectures = {"x86_64", "aarch64", "s390x", "ppc64le"}
+    try:
+        container.start()
+        exit_code, output = container.exec(["uname", "-m"])
+        assert exit_code == 0, f"uname -m failed: {output}"
+        arch = output.decode().strip()
+        if arch not in known_architectures:
+            raise ValueError(f"Unexpected architecture {arch!r}, expected one of {known_architectures}")
+        return arch
+    finally:
+        with docker_utils.BestEffortCleanup():
+            docker_utils.NotebookContainer(container).stop(timeout=0)
+
+
+@pytest.fixture(scope="session")
 def runtime_image(image: str):
     image_metadata = get_image_metadata(image)
 
@@ -135,25 +223,25 @@ def runtime_image(image: str):
     yield image_metadata
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def workbench_image(image: str):
     skip_if_not_workbench_image(image)
     yield image
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def cuda_image(image: str):
     skip_if_not_cuda_image(image)
     yield image
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def rocm_image(image: str):
     skip_if_not_rocm_image(image)
     yield image
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def jupyterlab_image(image: str) -> Image:
     image_metadata = skip_if_not_workbench_image(image)
     if "-jupyter-" not in image_metadata.labels["name"]:
@@ -162,17 +250,21 @@ def jupyterlab_image(image: str) -> Image:
     return image_metadata
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def jupyterlab_datascience_image(jupyterlab_image: Image) -> Image:
-    if "-minimal-" in jupyterlab_image.labels["name"]:
+    name = jupyterlab_image.labels["name"]
+    # baseline is a lean JupyterLab workbench (Elyra/Kale/PDF) without the
+    # datascience / DB-connector Python stack covered by these tests.
+    if "-minimal-" in name or "-baseline-" in name:
         pytest.skip(
-            f"Image {jupyterlab_image.name} is not datascience image because it has '-minimal-' in {jupyterlab_image.labels['name']=}'"
+            f"Image {jupyterlab_image.name} is not datascience image because it has "
+            f"'-minimal-' or '-baseline-' in {name=}"
         )
 
     return jupyterlab_image
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def jupyterlab_trustyai_image(jupyterlab_image: Image) -> Image:
     if "-trustyai-" not in jupyterlab_image.labels["name"]:
         pytest.skip(
@@ -182,32 +274,27 @@ def jupyterlab_trustyai_image(jupyterlab_image: Image) -> Image:
     return jupyterlab_image
 
 
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def datascience_image(image: str) -> Image:
     image_metadata = get_image_metadata(image)
-    if "-minimal-" in image_metadata.labels["name"]:
+    name = image_metadata.labels["name"]
+    if image_metadata.workbench_type is WorkbenchType.CHE_CODE:
+        pytest.skip(f"Image {image} is a Che Code workbench without the datascience Python stack")
+    if "-minimal-" in name or "-baseline-" in name:
         pytest.skip(
-            f"Image {image_metadata.name} is not datascience image because it has '-minimal-' in {image_metadata.labels['name']=}'"
+            f"Image {image_metadata.name} is not datascience image because it has "
+            f"'-minimal-' or '-baseline-' in {name=}"
         )
 
     return image_metadata
 
 
-@pytest.fixture(scope="function")
-def rstudio_image(image: str) -> Image:
-    image_metadata = skip_if_not_workbench_image(image)
-    if not utils.is_rstudio_image(image):
-        pytest.skip(f"Image {image} does not have '-rstudio-' in {image_metadata.labels['name']=}'")
-
-    return image_metadata
-
-
-@pytest.fixture(scope="function")
+@pytest.fixture(scope="session")
 def codeserver_image(image: str) -> Image:
+    """Skip unless the image is any VS Code workbench (code-server or che-code)."""
     image_metadata = skip_if_not_workbench_image(image)
-    if "-code-server-" not in image_metadata.labels["name"]:
-        pytest.skip(f"Image {image} does not have '-code-server-' in {image_metadata.labels['name']=}'")
-
+    if not image_metadata.workbench_type.is_vscode:
+        pytest.skip(f"Image {image} is {image_metadata.workbench_type}, not a VS Code workbench")
     return image_metadata
 
 
@@ -276,7 +363,7 @@ def test_frame():
         """
 
         def __init__(self):
-            self.resources: list[tuple[Any, Callable]] = []
+            self.resources: list[tuple[Any, Callable | None]] = []
 
         def append[T](self, resource: T, cleanup_func: Callable[[T], None] | None = None) -> T:
             """Runs the Context manager lifecycle on the resource,
@@ -288,14 +375,23 @@ def test_frame():
 
             This is somewhat similar to Go's `defer`."""
             self.resources.append((resource, cleanup_func))
-            return resource.__enter__()  # noqa: PLC2801 Unnecessary dunder call to `__enter__`
+            return resource.__enter__()  # ruff: ignore[unnecessary-dunder-call] Unnecessary dunder call to `__enter__`
 
         def destroy(self):
             """Runs __exit__() on the registered resources as a cleanup."""
             for resource, cleanup_func in reversed(self.resources):
-                if cleanup_func is not None:
-                    cleanup_func(resource)
-                resource.__exit__(None, None, None)  # don't use named args, there are inconsistencies
+                try:
+                    if cleanup_func is not None:
+                        cleanup_func(resource)
+                except Exception:
+                    logging.exception("Cleanup callback failed for %r (continuing teardown)", resource)
+                try:
+                    resource.__exit__(None, None, None)  # don't use named args, there are inconsistencies
+                except Exception:
+                    # Transient podman API failures (e.g. RemoteDisconnected during
+                    # IPv6 network removal) should not abort teardown of remaining
+                    # resources. The orphaned resource will be GC'd by podman.
+                    logging.exception("Context exit failed for %r (continuing teardown)", resource)
 
     t = TestFrame()
     yield t

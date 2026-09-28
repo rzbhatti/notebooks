@@ -11,7 +11,7 @@ metadata:
     build.appstudio.redhat.com/target_branch: '{{target_branch}}'
     pipelinesascode.tekton.dev/cancel-in-progress: 'true'
     pipelinesascode.tekton.dev/max-keep-runs: '3'
-    pipelinesascode.tekton.dev/on-comment: ^/kfbuild\s+(all|odh\-workbench\-jupyter\-datascience\-cpu\-py312\-ubi9|jupyter/datascience/ubi9\-python\-3\.12)
+    pipelinesascode.tekton.dev/on-comment: ^/(kfbuild\-all|build\-konflux|build\-datascience)
     pipelinesascode.tekton.dev/on-cel-expression: |
       event == "pull_request" && target_branch == "main" && !("manifests/base/params-latest.env".pathChanged()) && ( ".tekton/odh-workbench-jupyter-datascience-cpu-py312-ubi9-pull-request.yaml".pathChanged() || "jupyter/utils/**".pathChanged() || "jupyter/datascience/ubi9-python-3.12/**".pathChanged() || "jupyter/datascience/ubi9-python-3.12/start-notebook.sh".pathChanged() || "jupyter/datascience/ubi9-python-3.12/build-args/cpu.conf".pathChanged() )
       && body.repository.full_name == "opendatahub-io/notebooks"
@@ -37,21 +37,91 @@ spec:
     value: 5d
   - name: build-platforms
     value:
-    - linux-mxlarge/amd64
+    - linux/x86_64
+    - linux-mxlarge/arm64
     - linux/ppc64le
     - linux/s390x
   - name: dockerfile
-    value: jupyter/datascience/ubi9-python-3.12/Dockerfile.cpu
+    value: jupyter/datascience/ubi9-python-3.12/Dockerfile.konflux.cpu
   - name: path-context
     value: .
   - name: build-args-file
     value: jupyter/datascience/ubi9-python-3.12/build-args/cpu.conf
+  # Hermetic: Cachi2 prefetches gomod (mongocli), RPMs+generic (shared minimal/odh), pip (requirements.cpu.txt)
+  - name: hermetic
+    value: 'true'
+  - name: prefetch-input
+    value:
+    - path: prefetch-input/mongocli
+      type: gomod
+    - path: prefetch-input/odh
+      type: rpm
+    - path: prefetch-input/odh
+      type: generic
+    - path: jupyter/datascience/ubi9-python-3.12
+      type: pip
+      binary:
+        arch: x86_64, aarch64, ppc64le, s390x
+      requirements_files: [requirements.cpu.txt]
   pipelineRef:
-    name: multiarch-combined-pipeline
+    name: multiarch-odh-main-combined-pipeline
   taskRunTemplate:
     serviceAccountName: build-pipeline-odh-workbench-jupyter-datascience-cpu-py312-ubi9
   workspaces:
   - name: git-auth
     secret:
       secretName: '{{ git_auth_secret }}'
-status: {}
+  taskRunSpecs:
+  - pipelineTaskName: prefetch-dependencies
+    computeResources:
+      requests:
+        cpu: '4'
+        memory: 8Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+  - pipelineTaskName: build-images
+    stepSpecs:
+    - name: build
+      computeResources:
+        requests:
+          cpu: '4'
+          memory: 8Gi
+          ephemeral-storage: 64Gi
+        limits:
+          cpu: '4'
+          memory: 8Gi
+          ephemeral-storage: 64Gi
+    - name: prepare-sboms
+      computeResources:
+        requests:
+          cpu: '4'
+          memory: 8Gi
+        limits:
+          cpu: '4'
+          memory: 8Gi
+  - pipelineTaskName: sast-unicode-check
+    computeResources:
+      limits:
+        memory: 8Gi
+
+  - pipelineTaskName: clair-scan
+    computeResources:
+      requests:
+        cpu: '8'
+        memory: 8Gi
+      limits:
+        cpu: '8'
+        memory: 8Gi
+  - pipelineTaskName: ecosystem-cert-preflight-checks
+    computeResources:
+      requests:
+        cpu: '4'
+        memory: 8Gi
+      limits:
+        cpu: '4'
+        memory: 8Gi
+  - pipelineTaskName: clamav-scan
+    computeResources:
+      limits:
+        memory: 8Gi

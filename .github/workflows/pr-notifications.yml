@@ -1,0 +1,90 @@
+---
+name: PR notifications (label + fork guidance)
+on:  # yamllint disable-line rule:truthy
+  # the regular `secrets.GITHUB_TOKEN` with `on: pull_request` results in a 403 error
+  #  HttpError: Resource not accessible by integration
+  pull_request_target:
+    types: [opened]
+
+jobs:
+  add-label:
+    if: contains(github.event.pull_request.labels.*.name, 'konflux-nudge') == false
+    permissions:
+      issues: write
+      # addLabels on PRs needs this despite docs saying issues:write suffices
+      pull-requests: write
+    runs-on: ubuntu-26.04
+    steps:
+
+      # SECURITY: never clone untrusted code in pull_request_target workflows
+
+      - name: Add review-requested label
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # language=javascript
+          script: |
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              labels: ['review-requested']
+            });
+
+  fork-guidance:
+    if: github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name
+    permissions:
+      pull-requests: write
+    runs-on: ubuntu-26.04
+    steps:
+
+      # SECURITY: never clone untrusted code in pull_request_target workflows
+
+      - name: Post guidance comment (once)
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # language=javascript
+          script: |
+            const prNumber = context.payload.pull_request.number;
+            const author = context.payload.pull_request.user.login;
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            const marker = 'fork-pr-guidance-posted-by-bot';
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100
+            });
+
+            if (comments.some(c => c.user?.login === 'github-actions[bot]' && c.body?.includes(marker))) {
+              core.info('Guidance comment already posted');
+              return;
+            }
+
+            const body = [
+              `<!-- ${marker} -->`,
+              `@${author} — This PR is from a fork.`,
+              'The `build-rhoai` CI job was skipped because subscription',
+              'builds (RHEL, AIPCC) need secrets unavailable to forks.',
+              'ODH builds and code quality checks still ran.',
+              '',
+              '**Recommended:** Push your branch to the main repo for full CI:',
+              '```',
+              `git remote add upstream https://github.com/${repo}.git`,
+              `git push upstream HEAD:${author}/your-branch-name`,
+              '```',
+              'Then open a new PR from that branch.',
+              '',
+              '**No push access?** A maintainer will cherry-pick and test your changes.',
+              '',
+              `See [CONTRIBUTING.md](https://github.com/${repo}/blob/main/CONTRIBUTING.md#contributing-from-branches-vs-forks) for details.`,
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body
+            });

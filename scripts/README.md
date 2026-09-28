@@ -48,17 +48,11 @@ Create a Python 3.11 version based on the Python 3.9 version for each one in the
 python scripts/new_python_based_image.py --context-dir . --source 3.9 --target 3.11 --match ./ --log-level DEBUG
 ```
 
-Updates package names in all Pipfiles found within a given directory and its subdirectories by querying PyPI for the canonical names:
-
-```sh
-python scripts/fix_package_naming.py --context-dir .
-```
-
 ## dockerfile_fragments.py
 
 Updates Dockerfile* blocks demarked using comment blocks of the form
 
-```
+```text
 # <prefix> begin
 [... ...]
 # <prefix> end
@@ -81,7 +75,7 @@ python scripts/cve/sbom_analyze.py sbom.json esbuild
 ```
 
 Output:
-```
+```text
 === Searching for 'esbuild' ===
   Found 1 matching package(s):
 
@@ -121,7 +115,16 @@ python scripts/cve/sbom_analyze.py sbom.json esbuild --json
 
 Create CVE tracker issues in the RHAIENG Jira project. The script finds CVE issues in RHOAIENG that don't have a parent tracker in RHAIENG, groups them by CVE ID and version, and creates one tracker per version with JQL links to the blocked child issues.
 
-Requires `JIRA_TOKEN` environment variable. `JIRA_URL` defaults to `https://issues.redhat.com`.
+Each new tracker is created with:
+
+- **Labels:** `CVE`, the CVE id (e.g. `CVE-2026-28498`), and `security`, so CVE work is distinguishable from other Bugs.
+- **Team:** Jira field `customfield_10001` set to the **AAIET Notebooks** team id as a **plain string** (required by the [REST create API](https://developer.atlassian.com/platform/teams/components/team-field-in-jira-rest-api/); default id from RHAIENG-3752). Override with **`JIRA_RHAIENG_TEAM_OPTION_ID`** if your site differs.
+- **Component:** `Notebooks` (unchanged).
+- **Security level:** `Red Hat Employee` by default; **`Embargoed Security Issue`** when any child is embargoed (security level or `EMBARGOED` summary prefix).
+- **Summary:** includes an `EMBARGOED` prefix when children are embargoed (so automation such as jira-autofix can detect embargoed work).
+- **Contributors** (`customfield_10466`): union of Contributors from all blocked RHOAIENG children, plus the authenticated user and optional **`JIRA_RHAIENG_EXTRA_CONTRIBUTORS`** (comma-separated Atlassian accountIds). Required for visibility under embargo ACL (changelog comments may say “involved users” but the field is Contributors).
+
+Requires Jira auth (e.g. `JIRA_EMAIL` + `JIRA_API_TOKEN`, or `JIRA_TOKEN` / OAuth per [`scripts/cve/jira_auth.py`](cve/jira_auth.py)). `JIRA_URL` defaults to `https://redhat.atlassian.net` in code; some docs still mention `issues.redhat.com` for legacy flows.
 
 ### Examples
 
@@ -191,8 +194,23 @@ python scripts/cve/cve_due_dates.py --summary
 
 CLI tool written in Go that computes the list of input files required to build a Dockerfile.
 This is useful to determine what images need to be built on CI when testing a GitHub Pull Request.
+CI now runs the published helper image from GHCR instead of compiling the tool on every runner.
 
 ### Examples
+
+**Podman run**:
+
+```shell
+podman run --rm \
+  -e TARGETPLATFORM=linux/amd64 \
+  -v "$PWD:$PWD:ro,z" \
+  -w "$PWD" \
+  ghcr.io/opendatahub-io/notebooks/buildinputs:main \
+  -build-arg=BASE_IMAGE=fake-image \
+  jupyter/datascience/ubi9-python-3.11/Dockerfile
+```
+
+**Native local binary**:
 
 ```shell
 make bin/buildinputs

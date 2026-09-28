@@ -1,25 +1,68 @@
 ---
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+
 # https://github.com/pre-commit/pre-commit-hooks?tab=readme-ov-file#hooks-available
 repos:
+  # https://prek.j178.dev/builtin/#1-automatic-fast-path
+  - repo: https://github.com/pre-commit/pre-commit-hooks  # Enables fast path
+    rev: v6.0.0  # This is ignored for fast path detection
+    hooks:
+      - id: trailing-whitespace
+        exclude: '^ci/secrets/'
+      - id: check-added-large-files
+      - id: end-of-file-fixer
+        exclude: '^ci/secrets/'
+      - id: check-json
+        exclude: '^ci/secrets/|tsconfig\.json$'
+      - id: check-toml
+      - id: check-yaml
+        args: ['--allow-multiple-documents']
+      - id: check-symlinks
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
   # https://docs.astral.sh/uv/guides/integration/pre-commit/
-  - repo: https://github.com/astral-sh/uv-pre-commit
-    rev: 0.9.29
+  # Root lockfile: bare `uv` (matches [tool.uv] required-version). Image locks: ./uv via make refresh-lock-files.
+  - repo: local
     hooks:
       - id: uv-lock
+        name: uv-lock
+        entry: uv lock --locked
+        language: system
+        files: '(^uv\.lock$|^pyproject\.toml$|^uv\.toml$)'
+        pass_filenames: false
   # https://github.com/astral-sh/ruff-pre-commit
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.0
+    rev: v0.16.2
     hooks:
-      - id: ruff
-        types_or: [python, pyi]
+      - id: ruff-check
+        types_or: [python, pyi, jupyter]
         args: [--fix]
-        files: 'ci/.*|tests/.*'
+        files: '^((ci|tests|ntb|base-images|scripts)/.*\.(py|pyi)|jupyter/.*\.ipynb)$'
       - id: ruff-format
         types_or: [python, pyi]
-        files: 'ci/.*|tests/.*'
+        files: '^(ci|tests|ntb|base-images|scripts)/.*\.(py|pyi)$'
+  # https://github.com/DavidAnson/markdownlint-cli2
+  # Enforces MD040 (fenced-code-language) and MD014 (commands-show-output); see .markdownlint-cli2.jsonc.
+  - repo: https://github.com/DavidAnson/markdownlint-cli2
+    rev: v0.23.2
+    hooks:
+      - id: markdownlint-cli2
+  # https://github.com/gitleaks/gitleaks
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
   # https://pre-commit.com/#new-hooks
   - repo: local
     hooks:
+      # Guard against accidental submodule ref bumps (commit-msg stage)
+      - id: guard-submodule-refs
+        name: guard-submodule-refs
+        language: python
+        entry: python ci/hooks/guard_submodule_refs.py
+        stages: [commit-msg]
+        always_run: true
       # https://github.com/microsoft/pyright/issues/3612
       # https://github.com/RobertCraigie/pyright-python#pre-commit
       - id: pyright

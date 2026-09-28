@@ -2,59 +2,67 @@
 name: Validation of software versions referenced in ImageStream manifests
 on:  # yamllint disable-line rule:truthy
   push:
-    # Since this check is so resource demanding, let's restrict also push action here.
-    paths:
-      - 'manifests/base/params.env'
-      - 'manifests/base/*-imagestream.yaml'
-      - 'ci/check-software-versions.py'
+    branches: [main, stable, 'rhoai-*']
+    # We use a YAML anchor (&trigger_paths) and alias (*trigger_paths) to deduplicate paths.
+    # Docs: https://yaml.org/spec/1.2.2/#3222-anchors-and-aliases
+    # Tutorial & Gotchas: https://frenck.dev/github-actions-yaml-anchors-aliases-merge-keys/
+    paths: &trigger_paths
+      - '.github/workflows/software-versions.yaml'
+      - '.github/actions/apt-install/**'
+      - '.github/actions/setup-uv/**'
+      - 'manifests/odh/base/params.env'
+      - 'manifests/odh/base/*-imagestream.yaml'
+      - 'manifests/rhoai/base/params.env'
+      - 'manifests/rhoai/base/*-imagestream.yaml'
+      - 'pytest.ini'
+      - 'tests/containers/manifest_validation_test.py'
   pull_request:
-    paths:
-      - 'manifests/base/params.env'
-      - 'manifests/base/*-imagestream.yaml'
-      - 'ci/check-software-versions.py'
+    paths: *trigger_paths
   workflow_dispatch:
-  release:
 
-permissions:
-  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   validation-of-sw-versions-in-imagestreams:
-    runs-on: ubuntu-latest
     env:
-      # Some pieces of code (image pulls for example) in podman consult TMPDIR or default to /var/tmp
-      TMPDIR: /home/runner/.local/share/containers/tmpdir
+      RHOAI_QUAY_BOT_USERNAME: ${{ secrets.RHOAI_QUAY_BOT_USERNAME }}
+      RHOAI_QUAY_BOT_PASSWORD: ${{ secrets.RHOAI_QUAY_BOT_PASSWORD }}
+    permissions:
+      contents: read
+    runs-on: ubuntu-26.04
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - name: Mount lvm overlay for podman operations
+      - name: Install dependencies
+        uses: ./.github/actions/apt-install
+        with:
+          packages: cosign skopeo
+          update: 'false'
+
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
+
+      - name: Unlock git-crypt and configure registry auth
+        uses: ./.github/actions/git-crypt-auth
+        with:
+          git-crypt-key: ${{ secrets.GIT_CRYPT_KEY }}
+
+      - name: Configure Docker auth for podman
         run: |
-          df -h
-          free -h
+          mkdir -p "$HOME/.docker"
+          cp ci/secrets/pull-secret.json "$HOME/.docker/config.json"
 
-          bash ./ci/cached-builds/gha_lvm_overlay.sh
-
-          df -h
-          free -h
-
-      - name: Configure Podman
+      - name: Configure Quay.io API auth for RHOAI namespace
+        # Keep the credentials at job scope: step-level env is unavailable while this if is evaluated.
+        if: env.RHOAI_QUAY_BOT_USERNAME != ''
         run: |
-          set -Eeuxo pipefail
+          QUAY_AUTH=$(echo -n "${RHOAI_QUAY_BOT_USERNAME}:${RHOAI_QUAY_BOT_PASSWORD}" | base64 -w 0)
+          echo "::add-mask::$QUAY_AUTH"
+          echo "QUAY_AUTH=$QUAY_AUTH" >> "$GITHUB_ENV"
+          printf '%s' "${RHOAI_QUAY_BOT_PASSWORD}" | skopeo login --username "${RHOAI_QUAY_BOT_USERNAME}" --password-stdin quay.io
 
-          sudo cp ci/cached-builds/storage.conf /etc/containers/storage.conf
-
-          # should reset storage when changing storage.conf
-          sudo mkdir -p $HOME/.local/share/containers/storage/tmp
-          # remote (CONTAINER_HOST) podman does not do reset (and refuses --force option)
-          sudo podman system reset --force
-          # podman running as service ignores the TMPDIR env var here, let's give it a bind-mount to /var/tmp
-          sudo mkdir -p $TMPDIR
-          sudo mount --bind -o rw,noexec,nosuid,nodev,bind $TMPDIR /var/tmp
-
-          # quick check that podman works
-          sudo podman info
-
-      - name: Check software versions in manifest referencing the images
-        id: software-versions-check
+      - name: Validate manifest annotations against Quay.io Clair scan
         run: |
-          sudo ./ci/check-software-versions.py --prune-podman-data
+          uv run pytest tests/containers/manifest_validation_test.py::test_old_tag_annotations_match_quay -v

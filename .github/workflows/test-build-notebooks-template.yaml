@@ -1,18 +1,14 @@
 ---
 name: Test Build Notebooks Template
 
-permissions:
-  contents: read
-  packages: write
-
 "on":
   push:
+    branches: [main, stable, 'rhoai-*']
     paths:
       - '.github/workflows/build-notebooks-TEMPLATE.yaml'
       - '.github/workflows/test-build-notebooks-template.yaml'
       - '.github/actions/install-podman-action/**'
       - '.github/actions/provision-k8s/**'
-      - '.github/actions/free-up-disk-space/**'
       - 'ci/cached-builds/**'
   pull_request:
     paths:
@@ -20,12 +16,18 @@ permissions:
       - '.github/workflows/test-build-notebooks-template.yaml'
       - '.github/actions/install-podman-action/**'
       - '.github/actions/provision-k8s/**'
-      - '.github/actions/free-up-disk-space/**'
       - 'ci/cached-builds/**'
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   test-template-minimal:
+    permissions:
+      contents: read
+      packages: write
     name: Test Template with Minimal Notebook
     uses: ./.github/workflows/build-notebooks-TEMPLATE.yaml
     with:
@@ -33,5 +35,8 @@ jobs:
       python: "3.12"
       github: ${{ toJson(github) }}
       platform: linux/amd64
-      subscription: false
+      # ODH midstream vs RHDS downstream: avoid exercising stale odh lockfiles on RHDS.
+      product: ${{ github.repository == 'red-hat-data-services/notebooks' && 'rhoai' || 'odh' }}
+      # jupyter-minimal PDF deps need RHEL AppStream on RHDS (RHAIENG-2345 / #2310).
+      subscription: ${{ github.repository == 'red-hat-data-services/notebooks' }}
     secrets: inherit

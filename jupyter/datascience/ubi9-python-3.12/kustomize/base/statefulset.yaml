@@ -32,10 +32,17 @@ spec:
             - name: notebook-port
               protocol: TCP
               containerPort: 8888
+          # Allow up to 180 seconds for startup on slow or constrained nodes (e.g. ppc64le in CI).
+          startupProbe:
+            tcpSocket:
+              port: notebook-port
+            periodSeconds: 10
+            successThreshold: 1
+            failureThreshold: 18
           livenessProbe:
             tcpSocket:
               port: notebook-port
-            initialDelaySeconds: 5
+            initialDelaySeconds: 0
             periodSeconds: 5
             successThreshold: 1
             failureThreshold: 3
@@ -48,10 +55,11 @@ spec:
             periodSeconds: 5
             successThreshold: 1
             failureThreshold: 3
+          # Jupyter + papermill share the pod cgroup; keep headroom for datascience tests on ppc64le CI.
           resources:
             limits:
               cpu: 500m
-              memory: 2Gi
+              memory: 4Gi
             requests:
               cpu: 500m
-              memory: 2Gi
+              memory: 4Gi

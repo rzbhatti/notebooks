@@ -1,0 +1,28 @@
+{
+  // tsconfig.json natively supports comments (JSONC format)
+  "compilerOptions": {
+    // noEmit project — no need for Node's strict ESM resolution ("nodenext").
+    // "bundler" assumes ESM without checking package.json for "type" field,
+    // working around tsc not recognizing package.json5.
+    "target": "esnext",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    // Playwright runs TS directly; no compilation step needed
+    "noEmit": true,
+    // Avoid errors from transitive type declarations (e.g. isomorphic-ws missing @types/ws)
+    "skipLibCheck": true,
+    // TS 6.0 defaults types to [] — we need Node.js types explicitly
+    "types": ["node"],
+    "allowImportingTsExtensions": true
+  },
+  "include": [
+    "playwright.config.ts",
+    "eslint.config.ts",
+    "tests/**/*.ts",
+    "scripts/**/*.ts"
+  ]
+  // cypress/ excluded: no cypress dependency or types installed
+}

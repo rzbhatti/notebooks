@@ -1,0 +1,341 @@
+# Hermetic Builds
+
+This guide explains the hermetic (offline, reproducible) build system introduced
+for notebook images, starting with `codeserver/ubi9-python-3.12`.
+
+## What is a hermetic build?
+
+A hermetic build is a container image build that runs **without network access**.
+Every dependency RPMs, npm packages, Python wheels, tarballs is downloaded
+and cached before the build starts. The Dockerfile installs exclusively from
+that local cache.
+
+Benefits:
+
+- **Reproducibility**  identical inputs produce identical outputs regardless
+  of mirror availability or upstream version drift.
+- **Auditability**  every package is pinned by URL + SHA-256 checksum in
+  committed lockfiles, making it trivial to verify what went into an image.
+- **Compliance**  required by Konflux / RHOAI release pipelines, which enforce
+  network isolation during builds.
+
+## Architecture overview
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│                     Lockfile inputs (committed)                  │
+│                                                                  │
+│  prefetch-input/odh/                                             │
+│    rpms.in.yaml ─────────► rpms.lock.yaml                        │
+│    artifacts.in.yaml ────► artifacts.lock.yaml                   │
+│                                                                  │
+│  pyproject.toml ─────────► requirements.cpu.txt                  │
+│                            uv.lock.d/pylock.cpu.toml             │
+│                                                                  │
+│  code-server/              (git submodule)                       │
+│    package-lock.json ────► npm tarballs (many)                   │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│               Prefetch  (before podman build)                    │
+│                                                                  │
+│  Local/GHA:   prefetch-all.sh → cachi2/output/deps/             │
+│  Konflux:     prefetch-dependencies Tekton task                  │
+└──────────────────┬───────────────────────────────────────────────┘
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────────────────┐
+│               Container build  (network-isolated)                │
+│                                                                  │
+│  podman build ... -v ./cachi2:/cachi2:z                          │
+│                                                                  │
+│  Dockerfile.konflux.cpu:                                           │
+│    dnf install … (from /cachi2/output/deps/rpm/)                 │
+│    npm ci --offline (from /cachi2/output/deps/npm/)              │
+│    uv pip install --no-index (from /cachi2/output/deps/pip/)     │
+│    COPY generic artifacts (from /cachi2/output/deps/generic/)    │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+## Build environments
+
+The same `Dockerfile.konflux.cpu` works across three environments. The difference is
+how dependencies are prefetched and how resource limits are applied.
+
+| Environment | Prefetch method | Resource limits | Docs |
+|---|---|---|---|
+| **Local** (laptop) | `prefetch-all.sh` | None (full machine resources) | [lockfile generators README](../scripts/lockfile-generators/README.md#local-development), [codeserver README](../codeserver/ubi9-python-3.12/README.md) |
+| **GitHub Actions** | Automatic workflow step | `NODE_OPTIONS` + `JOBS` capped via `--env` | [GHA workflow](#github-actions) |
+| **Konflux** | Tekton `prefetch-dependencies` task | None (large VMs) | [Konflux pipelines](#konflux) |
+
+### Local
+
+GitHub Actions sets `RELEASE_PYTHON_VERSION` and `BUILD_ARCH` on the job before
+`prefetch-all.sh` runs. Set the same variables locally — the repo `.venv` is
+Python 3.14 (dev scripts), while `*-python-3.12` images need pip markers
+evaluated as **3.12** during prefetch.
+
+```bash
+# 1. Init submodules (component-specific; e.g. code-server or mongocli)
+git submodule update --init --recursive
+
+# 2. Dev venv (pyyaml, packaging, uv — runs prefetch scripts)
+uv sync
+source .venv/bin/activate
+
+# 3. Prefetch — BUILD_ARCH must match the platform you will build
+RELEASE_PYTHON_VERSION=3.12 BUILD_ARCH=linux/arm64 \
+  ./scripts/lockfile-generators/prefetch-all.sh \
+    --component-dir codeserver/ubi9-python-3.12
+
+# 4. Build (Makefile auto-detects cachi2/output/)
+gmake codeserver-ubi9-python-3.12 BUILD_ARCH=linux/arm64 PUSH_IMAGES=no
+```
+
+For other hermetic images (e.g. jupyter datascience), change `--component-dir`
+and the `gmake` target; keep `RELEASE_PYTHON_VERSION=3.12` and matching
+`BUILD_ARCH`.
+
+The Makefile detects `cachi2/output/` and the target's `prefetch-input/`
+directory, then injects two volume mounts: `cachi2/output` at `/cachi2/output`
+(prefetched deps) and `repos.d/` at `/etc/yum.repos.d/` (hermeto-generated RPM
+repos). Non-hermetic targets are unaffected.
+
+Full walkthrough, verification steps, and troubleshooting:
+[lockfile generators README — Local development](../scripts/lockfile-generators/README.md#local-development).
+
+See also the [codeserver README](../codeserver/ubi9-python-3.12/README.md) for
+codeserver-specific prerequisites and manual `podman build` instructions.
+
+### GitHub Actions
+
+The workflow template (`.github/workflows/build-notebooks-TEMPLATE.yaml`)
+handles hermetic builds transparently for any target that ships a
+`prefetch-input/` directory:
+
+1. **Prefetch step** -- gated by `[ -d "$COMPONENT_DIR/prefetch-input" ]`.
+   Installs `pyyaml` and `uv`, then runs `prefetch-all.sh` with job-level
+   `RELEASE_PYTHON_VERSION` and `BUILD_ARCH` (see
+   `.github/workflows/build-notebooks-TEMPLATE.yaml`).
+   For subscription builds (AIPCC base images), the step automatically
+   passes `--rhds --activation-key ... --org ...` so that the RHDS variant
+   lockfiles are used instead of the ODH (CentOS Stream) ones. This avoids
+   RPM conflicts between the RHEL-based base image and CentOS Stream
+   packages (e.g. `openssl-fips-provider` vs `openssl-fips-provider-so`).
+2. **Build step** -- runs `make` as usual. The volume mount is appended to
+   `CONTAINER_BUILD_CACHE_ARGS` by the prefetch step itself.
+3. **Resource limits** -- GHA runners have 4 vCPUs and 16 GB RAM, which is
+   tight for compiling VS Code from source. For codeserver targets the
+   workflow passes `--build-arg GHA_BUILD=true`. Inside the Dockerfile,
+   `apply-patch.sh` detects this flag and runs `patches/tweak-gha.sh`,
+   which reduces VS Code build parallelism (fewer mangler/transpiler
+   workers, smaller Node.js heap) to fit within the runner's memory.
+4. **Disk optimization** -- `--layers=false` is passed to `podman build`
+   for codeserver targets to avoid persisting intermediate layers, cutting
+   peak disk usage roughly in half.
+
+Targets without a `prefetch-input/` directory skip all of the above.
+
+### Konflux
+
+In the Konflux environment, hermetic builds use the Tekton pipeline:
+
+1. The PipelineRun YAML (`.tekton/odh-workbench-codeserver-*-pull-request.yaml`)
+   declares `prefetch-input` entries pointing to lockfiles under
+   `prefetch-input/odh/` (or `rhds/` for downstream).
+2. The `prefetch-dependencies` Tekton task runs cachi2 to download all
+   dependencies before the build.
+3. Konflux injects cachi2 repos automatically and manages network isolation
+   at the pipeline level.
+4. No `NODE_OPTIONS` or `JOBS` limits  Konflux VMs have significantly
+   more resources than GHA runners.
+
+Developers do not run `prefetch-all.sh` for Konflux  the pipeline handles
+everything. The lockfiles must be committed and up-to-date.
+
+## What changed to make builds hermetic
+
+### Dockerfile.konflux.cpu (multi-stage, network-isolated)
+
+The Dockerfile was rewritten from a network-dependent build to a fully offline
+one. Key changes in each stage:
+
+**`rpm-base` stage**  builds code-server from prefetched source:
+- `code-server` source is vendored as a git submodule under
+  `prefetch-input/code-server/` instead of being `git clone`'d at build time.
+- Node.js is installed from prefetched RPMs (via `dnf install nodejs` from
+  the local cachi2 repo) instead of downloading via nvm.
+- `npm ci --offline` replaces `npm install`: all `resolved` URLs in
+  `package-lock.json` are rewritten to `file:///cachi2/output/deps/npm/`.
+- Electron, node-gyp headers, Playwright, and VS Code extensions are copied
+  from prefetched generic artifacts; ripgrep is installed from the RHOAI Python
+  wheel (deps/pip) and the patched @vscode/ripgrep postinstall copies it.
+- `nfpm` (RPM packager) is installed from a prefetched RPM instead of
+  downloading from GitHub.
+
+**`cpu-base` stage**  OS packages and tools:
+- All `dnf install` commands use the local cachi2 RPM repo (hermeto repos
+  are injected unconditionally).
+- The `oc` client is installed from the openshift-clients RPM (prefetched in
+  deps/rpm) instead of downloading a tarball from mirror.openshift.com.
+
+**`codeserver` stage**  final image:
+- Python packages are installed with `uv pip install --no-index --find-links
+  /cachi2/output/deps/pip/`.
+- The code-server RPM is copied from the `rpm-base` stage.
+- **PYTHONPATH** is set to `/opt/app-root/lib/python3.12/site-packages` (not
+  the Python binary path) so the app interpreter and runtime-installed
+  packages (e.g. DB clients) are found. See
+  [codeserver/ubi9-python-3.12/docs/mysql-test-failure-analysis.md](../codeserver/ubi9-python-3.12/docs/mysql-test-failure-analysis.md).
+
+### Lockfiles and inputs (prefetch-input/)
+
+New files committed under `codeserver/ubi9-python-3.12/prefetch-input/`:
+
+| File | Purpose |
+|------|---------|
+| `odh/rpms.in.yaml` | RPM package list + repo definitions (upstream) |
+| `odh/rpms.lock.yaml` | Resolved RPM URLs + checksums per arch |
+| `odh/artifacts.in.yaml` | Generic artifact URLs (GPG keys, tarballs, etc.) |
+| `odh/artifacts.lock.yaml` | Resolved URLs + SHA-256 checksums |
+| `rhds/rpms.in.yaml` | RPM package list (downstream, RHEL repos) |
+| `rhds/artifacts.in.yaml` | Generic artifacts (downstream) |
+| `repos/` | Shared DNF `.repo` files (ubi, centos, epel) |
+| `patches/` | Build patches for offline operation |
+| `code-server/` | Git submodule (vendored source) |
+
+### Lockfile generators (scripts/lockfile-generators/)
+
+A suite of scripts to generate, resolve, and download hermetic build
+dependencies. See the full
+[lockfile-generators README](../scripts/lockfile-generators/README.md) for
+detailed usage.
+
+| Script | Purpose |
+|--------|---------|
+| `prefetch-all.sh` | Orchestrator — runs all five generators in order |
+| `create-artifact-lockfile.py` | Generic artifacts → `artifacts.lock.yaml` |
+| `create-rpm-lockfile.sh` | RPMs → `rpms.lock.yaml` (via `rpm-lockfile-prototype`) |
+| `download-npm.sh` | npm tarballs → `cachi2/output/deps/npm/` |
+| `create-requirements-lockfile.sh` | pip → `pylock.toml` + `requirements.txt` |
+| `create-go-lockfile.sh` | Go modules → `cachi2/output/deps/gomod/` (via Hermeto) |
+
+### Makefile
+
+The `build_image` macro was updated to auto-detect hermetic builds:
+
+```makefile
+$(eval CACHI2_VOLUME := $(if $(and $(wildcard cachi2/output),$(wildcard $(BUILD_DIR)prefetch-input)),\
+    --volume $(ROOT_DIR)cachi2/output:/cachi2/output:Z \
+    --volume $(ROOT_DIR)cachi2/output/deps/rpm/$(RPM_ARCH)/repos.d/:/etc/yum.repos.d/:Z,))
+```
+
+This evaluates per-target: only targets with both `cachi2/output/` and a
+`prefetch-input/` directory get the volume mounts. The second mount overlays
+`/etc/yum.repos.d/` with hermeto-generated repos, making local builds behave
+like Konflux (repos are already in place when the Dockerfile runs). All other
+targets are completely unaffected.
+
+### GitHub Actions workflow
+
+Changes to `.github/workflows/build-notebooks-TEMPLATE.yaml`:
+
+- **Prefetch step** added before the build, gated by the existence of a
+  `prefetch-input/` directory in the target component (not hardcoded to
+  codeserver). Runs `prefetch-all.sh`.
+- **Submodule checkout** (`submodules: recursive`) enabled for all targets.
+  Git LFS is enabled only for codeserver (`lfs: contains(inputs.target, 'codeserver')`).
+- **Resource limits** -- `--build-arg GHA_BUILD=true` for codeserver targets.
+  Inside the build, `apply-patch.sh` calls `patches/tweak-gha.sh` to reduce
+  VS Code build parallelism for the runner's 16 GB RAM.
+- **Layer optimization** -- `--layers=false` for codeserver builds.
+
+### Tekton pipelines (.tekton/)
+
+Updated PipelineRun YAMLs to:
+- Set `hermetic: "true"`.
+- Add `prefetch-input` entries pointing to `prefetch-input/odh/` for RPMs
+  and generic artifacts, to the component root for pip (with arch-specific
+  binary wheels), and to every `package-lock.json` directory for npm.
+- Reference `multiarch-odh-main-combined-pipeline` with `enable-cache-proxy: "true"`.
+- **Codeserver only:** Add `taskRunSpecs` for the `build-images` task (8 CPU,
+  32Gi memory) so the post-build rsync step (transferring the large image
+  from the remote builder) does not OOM or drop the connection. See
+  [konflux.md](konflux.md).
+
+### sandbox.py
+
+Updated to handle:
+- Git submodule directories in the build context.
+- macOS `PermissionError` with dotfiles/xattrs during context copying.
+- Glob pattern expansion for prerequisites.
+
+## Upstream (ODH) vs downstream (RHDS)
+
+Lockfiles are organized into two variant directories:
+
+```text
+prefetch-input/
+├── repos/           # shared .repo files
+├── odh/             # upstream (UBI + CentOS Stream + EPEL repos)
+│   ├── rpms.in.yaml
+│   ├── rpms.lock.yaml
+│   ├── artifacts.in.yaml
+│   └── artifacts.lock.yaml
+└── rhds/            # downstream (RHEL subscription repos)
+    ├── rpms.in.yaml
+    └── artifacts.in.yaml
+```
+
+The `--rhds` flag on `prefetch-all.sh` switches to the downstream variant:
+
+```bash
+# Upstream (default)
+RELEASE_PYTHON_VERSION=3.12 BUILD_ARCH=linux/arm64 \
+  scripts/lockfile-generators/prefetch-all.sh \
+    --component-dir codeserver/ubi9-python-3.12
+
+# Downstream
+RELEASE_PYTHON_VERSION=3.12 BUILD_ARCH=linux/arm64 \
+  scripts/lockfile-generators/prefetch-all.sh \
+    --component-dir codeserver/ubi9-python-3.12 \
+    --rhds --activation-key my-key --org my-org
+```
+
+Tekton PipelineRun YAMLs point at `prefetch-input/odh` for upstream or
+`prefetch-input/rhds` for downstream.
+
+## How repo injection works
+
+Repos are injected by the **infrastructure**, not by the Dockerfile:
+
+- **Local/GHA**: The Makefile volume-mounts `repos.d/` at `/etc/yum.repos.d/`,
+  overlaying the base image's default repos.
+- **Konflux**: The [`buildah-oci-ta`](https://github.com/konflux-ci/build-definitions/blob/main/task/buildah-oci-ta/)
+  task volume-mounts `YUM_REPOS_D_FETCHED` at `/etc/yum.repos.d/` in the same way.
+
+Both environments replace the base image's default repos with
+hermeto-generated repos. For targets that need nodejs (e.g. codeserver),
+`rpms.in.yaml` declares `moduleEnable: [nodejs:22]`, which makes hermeto
+include module metadata (`modules.yaml`) in the repodata. The Dockerfile
+then runs `dnf module enable nodejs:22 -y` to activate the module stream.
+
+## Container tests (GHA vs local)
+
+After the image is built, the workflow runs container tests (e.g. `tests/containers`
+with pytest). On GitHub Actions the daemon is **rootful Podman**; the Docker
+compat API can return image labels in `ContainerConfig` instead of `Config`.
+The test suite (`conftest.py`) reads labels from **both** so code-server
+detection and the MySQL connection test work in CI. See
+[tests/containers/docs/github-vs-local-image-metadata.md](../tests/containers/docs/github-vs-local-image-metadata.md).
+
+## Further reading
+
+- [codeserver/ubi9-python-3.12/README.md](../codeserver/ubi9-python-3.12/README.md) —
+  build instructions for the codeserver image (local, GHA, Konflux).
+- [scripts/lockfile-generators/README.md](../scripts/lockfile-generators/README.md) —
+  detailed documentation for all lockfile generator scripts.
+- [docs/konflux.md](konflux.md) — Konflux environment links and tenant setup.
+- [tests/containers/docs/github-vs-local-image-metadata.md](../tests/containers/docs/github-vs-local-image-metadata.md) —
+  why image metadata (labels) can differ between GHA and local, and how the test suite handles it.

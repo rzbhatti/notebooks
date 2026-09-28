@@ -12,37 +12,71 @@ Python CVEs in notebook images can come from:
 
 The resolution strategy differs based on which type is affected.
 
-## Centralized CVE Constraints
+## Centralized dependency rules
 
-To prevent CVEs from returning through transitive dependencies, we maintain a centralized constraints file:
+Global lock inputs live under `dependencies/` and are always passed to
+`uv pip compile` during `make refresh-lock-files`:
 
+| File | uv flag | Purpose |
+|------|---------|---------|
+| `dependencies/constraints.txt` | `--constraints` | Global version **floors** (`package>=X`) |
+| `dependencies/overrides.txt` | `--override` | Global **forced pins/ranges** when a floor is insufficient |
+| `pyproject.toml` `[tool.uv.override-dependencies]` | (from pyproject) | **Image-specific** overrides |
+
+See [`dependencies/README.md`](../../dependencies/README.md) for format rules and branch policy.
+
+**Prefer `constraints.txt` over `overrides.txt`.** Put shared rules in the `.txt`
+files; put subset-specific rules in individual `pyproject.toml` files.
+
+### `constraints.txt` structure
+
+Two sections:
+
+```text
+# --- CVE-motivated floors ---
+# RHAIENG-XXXX: CVE-YYYY-ZZZZ short description
+package>=fixed_version
+
+# --- General floors ---
+# Non-CVE policy/resolver floors
+other-package>=version
 ```
-dependencies/cve-constraints.txt
-```
 
-This file is automatically applied during lock file generation via `uv pip compile --constraints`. It ensures that even packages not explicitly in `pyproject.toml` (transitive dependencies) never go below the fixed version for CVEs we've resolved.
+Keep **one line and one comment per package** (most restrictive floor only).
+Do not maintain a historical ledger of superseded CVE fixes.
 
-### How It Works
+### Branch policy
+
+| Repo / branch | When to update `constraints.txt` |
+|---------------|----------------------------------|
+| `opendatahub-io/notebooks` `main` | Lock-renewal auto-syncs with the latest AIPCC index. Once a fixed version is on AIPCC, lock renewal picks it up — do not add constraints solely to track a fix the index already ships. |
+| `red-hat-data-services/notebooks` `rhoai-x.y` | Audit proof of what the release enforces. **Keep updating** when backporting CVE fixes. |
+
+### How it works
 
 1. **Constraints file format** (requirements.txt style):
-   ```
-   # CVE-ID: Description
-   # Reference: https://...
+   ```text
+   # RHAIENG-XXXX: CVE-YYYY-ZZZZ description
    package>=fixed_version
    ```
 
-2. **Automatic application**: The `pylocks_generator.sh` script applies these constraints to all lock file generations.
+2. **Automatic application**: `scripts/pylocks_generator.py` always passes
+   `--constraints` and `--override` for the global files to all lock generations.
 
-3. **Override for conflicts**: Some packages (like odh-elyra's appengine-python-standard) have conflicting version requirements. For these, use `override-dependencies` in the specific image's `pyproject.toml`.
+3. **Override for conflicts**: When a floor is insufficient or loses resolver
+   conflicts, use `dependencies/overrides.txt` (global) or `override-dependencies`
+   in a specific image's `pyproject.toml` (image-specific).
 
-### Adding a New CVE Constraint
+### Adding a new CVE constraint
 
-1. Add the constraint to `dependencies/cve-constraints.txt`:
-   ```
+1. Add the constraint to `dependencies/constraints.txt` in the CVE section:
+   ```text
    # RHAIENG-XXXX: CVE-YYYY-ZZZZZ package_name vulnerability description
    # Upstream: https://github.com/...
    package_name>=fixed_version
    ```
+   On `main`, only add if the resolver/index sync alone cannot guarantee the floor.
+   On `rhoai-x.y` release branches, add to document and enforce the fix.
 
 2. Regenerate all lock files:
    ```bash
@@ -97,6 +131,44 @@ uv tree --invert tornado
 
 Example: Tornado is typically pulled in by `jupyter-server`.
 
+### Step 4.5: Verify Package Availability on the RH Index
+
+Before attempting to fix the CVE, check that the fixed version is actually available
+on the RH index. A version may exist on PyPI but not on the RH index — this is a
+common blocker for downstream (RHOAI) images.
+
+```bash
+# Check which versions are on the production RH index
+curl -sL "https://packages.redhat.com/api/pypi/public-rhai/rhoai/3.4/cpu-ubi9/simple/<package>/?format=json" \
+  | python3 -c "
+import json,sys
+data = json.load(sys.stdin)
+versions = sorted({f['filename'].split('-')[1] for f in data.get('files',[])})
+print('\n'.join(versions))
+"
+```
+
+There are **three layers** that can block a CVE fix from resolving:
+
+1. **RH index**: The fixed version may not have been built by AIPCC yet.
+   If missing, request it via the [AIPCC dashboard](https://dashboard.aipcc.redhat.com/package-request).
+
+2. **Builder constraints**: The `wheels/builder` project may pin an older version
+   in `collections/torch-*/constraints.txt`. For example, `onnx==1.20.0` was pinned
+   with `# AIPCC-7623 - Constraining onnx while we carry patches`, preventing
+   1.21.0 from appearing on the index even after the onboarding pipeline ran.
+   Check with: `glab api --hostname gitlab.com "projects/58339326/search?scope=blobs&search=<package>%3D%3D"`
+
+3. **Upstream SDK exact pins**: Packages like `codeflare-sdk` may exact-pin the
+   vulnerable version (e.g., `cryptography==46.0.6`, `ray[data]==2.53.0`). These
+   conflicts surface during `make refresh-lock-files` as "unsatisfiable" errors.
+   Coordinate with the owning team per the
+   [component-team-owned packages](https://gitlab.cee.redhat.com/data-hub/guide/-/blob/main/docs/notebooks/cves/python.md)
+   procedure.
+
+If the fixed version is not on the RH index, **do not proceed to Step 5** — the
+lock refresh will fail. Instead, request the build and revisit once it is available.
+
 ### Step 5: Resolve the CVE
 
 #### Option A: Upgrade the Direct Dependency
@@ -112,8 +184,8 @@ Example: Tornado is typically pulled in by `jupyter-server`.
 
 If the direct dependency can't be upgraded but the transitive package version is flexible:
 
-1. Add to `dependencies/cve-constraints.txt`:
-   ```
+1. Add to `dependencies/constraints.txt` (CVE section):
+   ```text
    # RHAIENG-2448: CVE-XXXX-YYYY tornado quadratic DoS
    tornado>=6.5.3
    ```
@@ -172,18 +244,18 @@ make jupyter-datascience-ubi9-python-3.12
 4. **Conflict**: odh-elyra depends on appengine-python-standard which requires urllib3<2
 
 **Solution**:
-1. Add to `dependencies/cve-constraints.txt` for general protection:
-   ```
+1. Add to `dependencies/constraints.txt` for general protection:
+   ```text
    # RHAIENG-2458: CVE-2025-66418 urllib3 decompression vulnerability
-   urllib3>=2.6.0
+   urllib3>=2.7.0
    ```
 
 2. Add override to jupyter images with odh-elyra (due to conflict):
    ```toml
    override-dependencies = [
-       # RHAIENG-2458: CVE-2025-66418 urllib3 - override needed because odh-elyra pulls in
+       # RHAIENG-2458: CVE-2026-44431 urllib3 - override (also CVE-2025-66418) needed because odh-elyra pulls in
        # appengine-python-standard which has an obnoxious urllib3<2 constraint
-       "urllib3>=2.6.0",
+       "urllib3>=2.7.0",
    ]
    ```
 
@@ -201,8 +273,10 @@ make jupyter-datascience-ubi9-python-3.12
 
 ## Related Files
 
-- `dependencies/cve-constraints.txt` - Centralized CVE constraints
-- `scripts/pylocks_generator.sh` - Lock file generator (applies constraints)
+- `dependencies/constraints.txt` - Global version floors (CVE and general sections)
+- `dependencies/overrides.txt` - Global forced pins/ranges
+- `dependencies/README.md` - Format rules and branch policy
+- `scripts/pylocks_generator.py` - Lock file generator (applies global inputs)
 - `pyproject.toml` - Direct dependencies and override-dependencies
 - `pylock.toml` / `uv.lock.d/` - Generated lock files
 

@@ -4,8 +4,9 @@
 #   - Added odh-notebooks-meta-workbench-datascience-deps (shared meta-package replacing
 #     individual deps like boto3, kafka-python-ng, numpy, pandas, plotly, scipy, scikit-learn)
 #   - Upgraded feast ~=0.59.0 (pinned for RHOAI 3.4 compatibility)
-#   - Excluded py-spy on ppc64le (maturin can't fetch crates.io in --network=none)
-#   - Added urllib3>=2.6.0 override (CVE-2025-66418)
+#   - py-spy excluded via exclude-dependencies (FIPS / RHAIENG-58916)
+#   - Added urllib3>=2.7.0 override (CVE-2026-44431, CVE-2026-44432; CVE-2025-66418 in 2.6.0)
+#   - protobuf>=7.36.1,<8 override (AIPCC-13675: UPB segfault fixed in 7.x)
 #   - Added local path source for the meta-package
 [project]
 name = "notebooks"
@@ -14,41 +15,56 @@ requires-python = "==3.12.*"
 
 dependencies = [
     # Installer/tooling used in Docker/CI (prefetched with main deps for cachi2 offline)
-    "uv==0.9.28",
-    "micropipenv[toml]==1.10.0",
+    "uv",
+    "micropipenv[toml]",
 
     # Base packages
-    "wheel~=0.46.3",
-    "setuptools~=80.9.0",
+    "wheel",
+    "setuptools",
 
-    "ipykernel~=7.1.0",
-    "debugpy==1.8.20",
+    "debugpy",
 
-    # Datascience packages
-    "feast~=0.59.0",
+    # RHAIENG-6157: VS Code Jupyter extension requires these
+    #  ipykernel: raw-kernel gate
+    #  jupyter+notebook: Jupyter-Server gate (s390x/ppc64le, no built-in native zeromq for nodejs)
+    "ipykernel",
+    "jupyter",
+    "notebook",
 
     # RHAIENG-1475: skl2onnx excluded on s390x for codeserver
-    "skl2onnx~=1.19.1; platform_machine != 's390x'",
+    "skl2onnx; platform_machine != 's390x'",
     "odh-notebooks-meta-workbench-datascience-deps",
 
     # Some extra useful packages
-    "opencensus~=0.11.4",
-    "smart-open~=7.5.0",
-    "virtualenv~=20.36.1",
-    # https://issues.redhat.com/browse/AIPCC-9544 py-spy excluded on ppc64le for codeserver
-    "py-spy~=0.4.1; platform_machine != 's390x' and platform_machine != 'ppc64le'",
-    "prometheus-client~=0.24.1",
+    "opencensus",
+    "smart-open",
+    "virtualenv",
+    "prometheus-client",
+    "ripgrep",
 ]
 
 [tool.uv]
+# RHAIENG-5451 / RHAIENG-7088: fail at lock-generation time (not inside the
+# Konflux build) if a package version lacks wheels for any architecture this
+# image ships. See opendatahub-io/notebooks#4422 for the dynamic alternative.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'linux' and platform_machine == 'ppc64le'",
+    "sys_platform == 'linux' and platform_machine == 's390x'",
+]
+exclude-dependencies = ["py-spy"]
+
 environments = [
-    "sys_platform == 'linux' and implementation_name == 'cpython'",
+    "sys_platform == 'linux' and implementation_name == 'cpython' and python_full_version == '3.12.*'",
 ]
 
 override-dependencies = [
-    # RHAIENG-2458: CVE-2025-66418 urllib3 decompression vulnerability
-    # Upstream: https://github.com/kubernetes-client/python/issues/2458
-    "urllib3>=2.6.0",
+    # AIPCC-13675: UPB segfault on s390x affects protobuf 6.33.5-6.33.6; fixed in 7.x.
+    # kfp 2.17.0's protobuf<7.0 is a conservative pin (gencode 6.31.1; APIs exist in 7.x).
+    # 7.x series only.
+    "protobuf>=7.36.1,<8",
 ]
+
 [tool.uv.sources]
 odh-notebooks-meta-workbench-datascience-deps = { path = "../../dependencies/odh-notebooks-meta-workbench-datascience-deps" }

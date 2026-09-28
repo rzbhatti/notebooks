@@ -1,0 +1,117 @@
+---
+name: '🛡️ Antigravity CI-Gated Review'
+
+"on":
+  workflow_run:
+    workflows:
+      - 'Build Notebooks (pr)'
+    types:
+      - 'completed'
+
+concurrency:
+  group: 'antigravity-ci-gated-review-${{ github.event.workflow_run.id }}'
+  cancel-in-progress: true
+
+jobs:
+  review:
+    if: |-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    # ubuntu-latest is ubuntu-24.04; stock podman/crun flakes in prepare-review-context (opendatahub-io/notebooks#4211).
+    runs-on: 'ubuntu-26.04'
+    timeout-minutes: 12
+    permissions:
+      actions: 'read'
+      contents: 'read'
+      issues: 'write'
+      packages: 'read'
+      pull-requests: 'write'
+    steps:
+      - name: 'Mint identity token'
+        id: 'mint_identity_token'
+        if: |-
+          ${{ vars.APP_ID }}
+        uses: 'actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1'  # v3.2.0
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-actions: 'read'
+          permission-contents: 'read'
+          permission-issues: 'write'
+          permission-pull-requests: 'write'
+
+      - name: 'Checkout repository'
+        uses: 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1'  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: 'Setup uv and Python'
+        uses: './.github/actions/setup-uv'
+
+      - name: 'Install from uv.lock (project + dev deps)'
+        run: 'uv sync --locked --package odh-ci-agent'
+
+      # odh-ci-prepare-review-context pulls the buildinputs image to resolve affected image targets.
+      - name: 'Login to GitHub Container Registry'
+        uses: 'docker/login-action@dbcb813823bdd20940b903addbd779551569679f'  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 'Install Podman'
+        uses: './.github/actions/install-podman-action'
+        with:
+          platform: 'linux/amd64'
+
+      - name: 'Prepare review context'
+        if: |-
+          github.event.workflow_run.pull_requests[0] != null
+        env:
+          ADDITIONAL_CONTEXT: 'CI-gated follow-up review after a successful notebook matrix build.'
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REVIEW_CONTEXT_PATH: 'review-context.json'
+        run: 'uv run --package odh-ci-agent odh-ci-prepare-review-context'
+
+      - name: 'Run CI-gated Antigravity review'
+        if: |-
+          github.event.workflow_run.pull_requests[0] != null
+        env:
+          ADDITIONAL_CONTEXT: 'CI-gated follow-up review after a successful notebook matrix build.'
+          AGY_RUN_STATISTICS_PATH: 'agy-run-statistics.json'
+          AGY_TRAJECTORY_DIR: 'agy-trajectory/pr-review'
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REVIEW_BODY_PATH: 'review-summary-body.md'
+          REVIEW_CONTEXT_PATH: 'review-context.json'
+        run: 'uv run --package odh-ci-agent odh-ci-review-pr'
+
+      - name: 'Upload Antigravity run statistics'
+        if: |-
+          always() && hashFiles('agy-run-statistics.json') != ''
+        uses: 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'  # v7.0.1
+        with:
+          name: 'antigravity-run-statistics-${{ github.run_id }}'
+          path: 'agy-run-statistics.json'
+          if-no-files-found: 'warn'
+
+      - name: 'Upsert review summary comment'
+        if: |-
+          github.event.workflow_run.pull_requests[0] != null
+        env:
+          GITHUB_APP_SLUG: ${{ steps.mint_identity_token.outputs.app-slug }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ steps.mint_identity_token.outputs.token || secrets.GITHUB_TOKEN || github.token }}
+          PULL_REQUEST_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          REVIEW_AUTHOR_LOGIN: ${{ steps.mint_identity_token.outputs.app-slug != '' && format('{0}[bot]', steps.mint_identity_token.outputs.app-slug) || 'github-actions[bot]' }}
+          REVIEW_BODY_PATH: 'review-summary-body.md'
+          WORKFLOW_RUN_URL: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+        run: 'uv run --package odh-ci-agent odh-ci-upsert-review-comment'

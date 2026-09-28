@@ -65,8 +65,8 @@ The `scripts/pylocks_generator.sh` script supports three modes:
 | Mode | Description |
 |------|-------------|
 | `auto` (default) | Uses `rh-index` if `uv.lock.d/` exists, otherwise `public-index` |
-| `public-index` | Uses public PyPI, generates/updates `pylock.toml` |
-| `rh-index` | Uses internal AIPCC indexes, generates `uv.lock.d/pylock.<flavor>.toml` |
+| `public-index` | Uses public PyPI, generates/updates `pylock.toml` and `requirements.cpu.txt` |
+| `rh-index` | Uses internal AIPCC indexes, generates `uv.lock.d/pylock.<flavor>.toml` and `requirements.<flavor>.txt` |
 
 #### Force Upgrade
 
@@ -115,7 +115,7 @@ The `test_image_pyprojects_version_alignment` test verifies:
 
 Example test failures:
 
-```
+```text
 SUBFAILED: boto3 has multiple specifiers: [~=1.42.29, ~=1.40.52]
   → Fix: Update all pyproject.toml files to use the same boto3 version
 
@@ -195,6 +195,24 @@ override-dependencies = [
 1. Check which manifest file is referenced in the error message
 2. Update the version number in the manifest's JSON array
 3. Only update the N version (current), not N-1 (previous release)
+
+## Prerequisites
+
+### Registry Access for `rh-index` Mode
+
+The `rh-index` lock refresh mode resolves the internal AIPCC PyPI index URL by
+inspecting the `com.redhat.aiplatform.index_url` label on the base container
+image specified in each `build-args/konflux.*.conf` file.
+
+This requires:
+
+- **`skopeo`** installed and on `$PATH`
+- **Network access** to the container registry hosting the base images
+- **Pull credentials** configured if the registry requires authentication
+  (e.g. via `skopeo login` or a Docker/Podman auth file)
+
+If `skopeo` is unavailable or the registry is unreachable, the resolver will
+report a clear error describing the failure.
 
 ## Related Files
 

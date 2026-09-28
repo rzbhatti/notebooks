@@ -5,16 +5,38 @@ requires-python = "==3.12.*"
 
 dependencies = [
     "odh-notebooks-meta-runtime-elyra-deps",
+    "odh-notebooks-meta-runtime-kale-deps",
 
     # Base packages
-    "setuptools==80.9.0",
-    "wheel==0.46.3",
+    "setuptools",
+    "wheel",
+
+    # Hermetic bootstrap: locked in requirements.*.txt; Dockerfile installs unpinned from find-links.
+    "micropipenv[toml]",
+    "uv",
 ]
 
 [tool.uv]
+# RHAIENG-5451 / RHAIENG-7088: fail at lock-generation time (not inside the
+# Konflux build) if a package version lacks wheels for any architecture this
+# image ships. See opendatahub-io/notebooks#4422 for the dynamic alternative.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'linux' and platform_machine == 'ppc64le'",
+    "sys_platform == 'linux' and platform_machine == 's390x'",
+]
 environments = [
-    "sys_platform == 'linux' and implementation_name == 'cpython'",
+    "sys_platform == 'linux' and implementation_name == 'cpython' and python_full_version == '3.12.*'",
+]
+
+override-dependencies = [
+    # AIPCC-13675: UPB segfault on s390x affects protobuf 6.33.5-6.33.6; fixed in 7.x.
+    # kfp 2.17.0's protobuf<7.0 is a conservative pin (gencode 6.31.1; APIs exist in 7.x).
+    # 7.x series only.
+    "protobuf>=7.36.1,<8",
 ]
 
 [tool.uv.sources]
 odh-notebooks-meta-runtime-elyra-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-elyra-deps" }
+odh-notebooks-meta-runtime-kale-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-kale-deps" }

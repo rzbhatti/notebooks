@@ -15,7 +15,7 @@ Example `NB_PREFIX`: `/notebook/<namespace>/<workbench-name>`
 ## Key Architectural Difference
 
 ### OpenShift Route (Old)
-```
+```text
 External: /notebook/user/workbench/app/
            ↓
 Route strips prefix
@@ -30,7 +30,7 @@ Container receives: /app/
 Both approaches work because the Route **forwards all traffic** to the pod regardless of path.
 
 ### Gateway API (New)
-```
+```text
 External: /notebook/user/workbench/app/
            ↓
 Gateway preserves full path (path-based routing)
@@ -42,7 +42,7 @@ Container receives: /notebook/user/workbench/app/
 
 ### Why Old Approaches Fail with Gateway API
 
-```
+```text
 App redirects: /notebook/user/workbench/app → /app
                                                ↓
 Browser follows redirect to: /app
@@ -66,7 +66,7 @@ These requirements apply **regardless of whether you use nginx or application-le
 
 Your workbench **must** respond to health checks at:
 
-```
+```http
 GET /{NB_PREFIX}/api
 ```
 
@@ -89,7 +89,7 @@ def kernels():
     # Handle culler endpoint
     return {'kernels': []}, 200
 
-@app.route(f'{nb_prefix}/api/terminals')  
+@app.route(f'{nb_prefix}/api/terminals')
 def terminals():
     # Handle culler endpoint
     return {'terminals': []}, 200
@@ -118,7 +118,7 @@ app.get(`${nbPrefix}/api/terminals`, (req, res) => {
 
 If your workbench supports culling idle workbenches, you must handle:
 
-```
+```http
 GET /{NB_PREFIX}/api/kernels
 GET /{NB_PREFIX}/api/terminals
 ```
@@ -218,7 +218,7 @@ fetch(menuUrl).then(...);
 ```nginx
 # ❌ REMOVE THIS - Too broad, causes infinite loops
 location ${NB_PREFIX}/ {
-    return 302 $custom_scheme://$http_host/app/;
+    return 302 /myapp/;
 }
 ```
 
@@ -226,21 +226,28 @@ location ${NB_PREFIX}/ {
 
 ### 2. Update Redirects to Preserve NB_PREFIX
 
-**All redirects must include `${NB_PREFIX}`** to keep requests within the Gateway route:
+**All redirects must include `${NB_PREFIX}`** to keep requests within the Gateway route. Use **relative** redirect targets only — do not build `Location` from `$http_host` or `$custom_scheme` (CWE-601 open redirect when the pod is accessed directly with a crafted `Host` header).
 
 ```nginx
 # ❌ BAD - Strips prefix
 location = ${NB_PREFIX} {
-    return 302 $custom_scheme://$http_host/myapp/;
+    return 302 /myapp/;
 }
 
-# ✅ GOOD - Preserves prefix
+# ❌ BAD - Reflects client Host header into Location (CWE-601)
 location ${NB_PREFIX} {
     return 302 $custom_scheme://$http_host${NB_PREFIX}/myapp/;
 }
+
+# ✅ GOOD - Relative path preserves prefix; nginx must not rewrite it absolute
+location ${NB_PREFIX} {
+    return 302 ${NB_PREFIX}/myapp/;
+}
 ```
 
-**Note**: Use `location ${NB_PREFIX}` (without `=`) to handle both with and without trailing slash.
+Set `absolute_redirect off;` in the nginx `server` block (or at build time via `nginxconf.sed`) so nginx keeps `Location` relative instead of expanding it with the listen address and client `Host`.
+
+**Note**: Use `location ${NB_PREFIX}` (without `=`) to handle both with and without trailing slash. `${NB_PREFIX}` is substituted at container startup by the platform, not taken from request headers.
 
 ### 3. Add Prefix-Aware Proxy Location
 
@@ -250,18 +257,18 @@ location ${NB_PREFIX} {
 location ${NB_PREFIX}/myapp/ {
     # Strip the prefix before proxying to backend
     rewrite ^${NB_PREFIX}/myapp/(.*)$ /$1 break;
-    
-    # Proxy to your application
-    proxy_pass http://localhost:8080/;
+
+    # Proxy to your application (127.0.0.1 avoids localhost → ::1 resolution on IPv6 hosts)
+    proxy_pass http://127.0.0.1:8080/;
     proxy_http_version 1.1;
-    
+
     # Essential for WebSocket support
     proxy_set_header Upgrade $http_upgrade;
     proxy_set_header Connection $connection_upgrade;
-    
+
     # Long timeout for interactive sessions
     proxy_read_timeout 20d;
-    
+
     # Pass through important headers
     proxy_set_header Host $http_host;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -349,10 +356,6 @@ See these files for complete examples:
 - **nginx config**: `codeserver/ubi9-python-3.12/nginx/serverconf/proxy.conf.template_nbprefix`
 - **startup script**: `codeserver/ubi9-python-3.12/run-nginx.sh`
 
-### RStudio
-- **nginx config**: `rstudio/c9s-python-3.11/nginx/serverconf/proxy.conf.template_nbprefix`
-- **startup script**: `rstudio/c9s-python-3.11/run-nginx.sh`
-
 ## Understanding nginx Location Matching
 
 nginx location blocks have different matching priorities:
@@ -374,16 +377,16 @@ location /prefix {
 For Gateway API, you need:
 
 ```nginx
-# Redirect root to app
+# Redirect root to app (relative Location; requires absolute_redirect off)
 location ${NB_PREFIX} {
-    return 302 $custom_scheme://$http_host${NB_PREFIX}/myapp/;
+    return 302 ${NB_PREFIX}/myapp/;
 }
 
 # Proxy app traffic (longer prefix wins)
 location ${NB_PREFIX}/myapp/ {
-    proxy_pass http://localhost:8080/;
+    proxy_pass http://127.0.0.1:8080/;
 }
 ```
 
-Request `/notebook/ns/wb` → matches first location → redirects  
+Request `/notebook/ns/wb` → matches first location → redirects
 Request `/notebook/ns/wb/myapp/` → matches second location (longer) → proxies

@@ -36,15 +36,22 @@ def bundle_task_ref(name) -> dict:
     """Returns a reference to a Konflux task bundle.
 
     Uses the `image-registry.yaml` file as an up-to-date source for the digests."""
-    with open(ROOT_DIR / ".tekton/image-registry.yaml") as f:
-        data = yaml.load(f, Loader=yaml.FullLoader)
-        images: list[str] = [image["spec"]["taskRef"]["bundle"] for image in data["items"]]
-        for image in images:
-            if re.search(f"^quay.io/konflux-ci/tekton-catalog/task-{name}:", image):
-                bundle = image
-                break
-        else:
-            raise Exception(f"Could not find bundle {name}")
+    registry_path = ROOT_DIR / ".tekton/image-registry.yaml"
+    try:
+        with open(registry_path) as f:
+            data = yaml.safe_load(f)
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"Required file {registry_path} not found. Bundle task references cannot be resolved without it."
+        ) from None
+
+    images: list[str] = [image["spec"]["taskRef"]["bundle"] for image in data["items"]]
+    for image in images:
+        if re.search(f"^quay.io/konflux-ci/tekton-catalog/task-{name}:", image):
+            bundle = image
+            break
+    else:
+        raise Exception(f"Could not find bundle {name}")
 
     return {
         "params": [
@@ -722,10 +729,20 @@ def component_build_pipeline(component_name, dockerfile_path, release, is_pr: bo
                             "memory": "8Gi",
                         },
                     },
-                    # leaving out "prefetch-dependencies" because we don't do hermetic build yet
                     # leaving out "build-images" for now, it already has a limit of 8Gi by default
                 }
-                for task_name in ("ecosystem-cert-preflight-checks", "clair-scan")
+                for task_name in (
+                    "ecosystem-cert-preflight-checks",
+                    "clair-scan",
+                    # prefetch-dependencies: upstream default is 3Gi, OOMs on pytorch/llmcompressor
+                    # (Hermeto downloads multiple ~900MB torch wheel variants in parallel).
+                    "prefetch-dependencies",
+                    # sast-unicode-check: upstream default is 4Gi, OOMs on large source trees.
+                    # Other projects also override this, e.g.
+                    # https://github.com/RedHatInsights/vmaas/blob/master/.tekton/vmaas-push.yaml
+                    "sast-unicode-check",
+                    # Related: KONFLUX-12286, KONFLUX-12587
+                )
             ],
             "taskRunTemplate": {},
             "workspaces": [{"name": "git-auth", "secret": {"secretName": "{{ git_auth_secret }}"}}],
@@ -854,7 +871,7 @@ else:
 
     class Tests:
         def test_compute_cel_expression(self, fs: pyfakefs.fake_filesystem.FakeFilesystem):
-            fs.cwd = ROOT_DIR
+            fs.cwd = ROOT_DIR  # pyright: ignore[reportAttributeAccessIssue]
             ROOT_DIR.mkdir(parents=True)
             pathlib.Path("a/").mkdir()
             pathlib.Path("b/").mkdir()

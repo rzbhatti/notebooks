@@ -2,7 +2,10 @@
 import argparse
 import contextlib
 import functools
+import pathlib
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -15,6 +18,9 @@ import unittest.mock
 The make commands this runs are intended to reproduce the commands we define in our OpenShift CI config at
 https://github.com/openshift/release/blob/master/ci-operator/config/opendatahub-io/notebooks/opendatahub-io-notebooks-main.yaml#L1485
 """
+
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parents[2]
+MAKE = shutil.which("gmake") or shutil.which("make") or "make"
 
 
 class Args(argparse.Namespace):
@@ -32,10 +38,15 @@ def main() -> None:
 
 
 def run_tests(target: str) -> None:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._+-]*", target):
+        raise ValueError(f"Invalid target: {target!r}")
+
     prefix = target.translate(str.maketrans(".", "-"))
     # this is a pod name in statefulset, some tests deploy individual unmanaged pods, though
     pod = prefix + "-notebook-0"  # `$(kubectl get statefulset -o name | head -n 1)` would work too
     namespace = "ns-" + prefix
+    if len(namespace) > 63 or not re.fullmatch(r"[a-z0-9]([-a-z0-9]*[a-z0-9])?", namespace):
+        raise ValueError(f"Invalid Kubernetes namespace derived from target: {namespace!r}")
 
     if target == "runtime-cuda-pytorch-llmcompressor-ubi9-python-3.12":
         deploy = "deploy9"
@@ -53,21 +64,13 @@ def run_tests(target: str) -> None:
     elif target.startswith("rocm-jupyter-"):
         deploy = "deploy9"
         deploy_target = target.replace("rocm-jupyter-", "jupyter-rocm-")
-    elif target.startswith("cuda-rstudio-"):
-        deploy = "deploy"
-        os = re.match(r"^cuda-rstudio-([^-]+-).*", target)
-        deploy_target = os.group(1) + target.removeprefix("cuda-")
-    elif target.startswith("rstudio-"):
-        deploy = "deploy"
-        os = re.match(r"^rstudio-([^-]+-).*", target)
-        deploy_target = os.group(1) + target
     else:
         deploy = "deploy9"
         deploy_target = target
 
-    check_call(f"kubectl create namespace {namespace}", shell=True)
-    check_call(f"kubectl config set-context --current --namespace={namespace}", shell=True)
-    check_call(f"kubectl label namespace {namespace} fake-scc=fake-restricted-v2", shell=True)
+    check_call(f"kubectl create namespace {shlex.quote(namespace)}", shell=True)
+    check_call(f"kubectl config set-context --current --namespace={shlex.quote(namespace)}", shell=True)
+    check_call(f"kubectl label namespace {shlex.quote(namespace)} fake-scc=fake-restricted-v2", shell=True)
 
     # wait for service account to be created, otherwise pod is refused to be created
     # $ bin/kubectl apply -k runtimes/minimal/ubi9-python-3.9/kustomize/base
@@ -76,24 +79,23 @@ def run_tests(target: str) -> None:
     # See https://github.com/kubernetes/kubernetes/issues/66689
     check_call("timeout 10s bash -c 'until kubectl get serviceaccount/default; do sleep 1; done'", shell=True)
 
-    check_call(f"make {deploy}-{deploy_target}", shell=True)
-    wait_for_stability(pod)
+    check_call(f"make {shlex.quote(f'{deploy}-{deploy_target}')}", shell=True)
+    wait_for_stability(pod, target)
 
     try:
         if target.startswith("runtime-"):
-            check_call(f"make validate-runtime-image image={target}", shell=True)
+            check_call(f"make validate-runtime-image image={shlex.quote(target)}", shell=True)
         elif target.startswith("rocm-runtime-"):
             check_call(
-                f"make validate-runtime-image image={target.replace('rocm-runtime-', 'runtime-rocm-')}", shell=True
+                f"make validate-runtime-image image={shlex.quote(target.replace('rocm-runtime-', 'runtime-rocm-'))}",
+                shell=True,
             )
-        elif target.startswith(("rstudio-", "cuda-rstudio-")):
-            check_call(f"make validate-rstudio-image image={target}", shell=True)
         elif target.startswith("codeserver-"):
-            check_call(f"make validate-codeserver-image image={target}", shell=True)
+            check_call(f"make validate-codeserver-image image={shlex.quote(target)}", shell=True)
         elif target.startswith("rocm-jupyter"):
-            check_call(f"make test-{target.replace('rocm-jupyter-', 'jupyter-rocm-')}", shell=True)
+            check_call(f"make test-{shlex.quote(target.replace('rocm-jupyter-', 'jupyter-rocm-'))}", shell=True)
         else:
-            check_call(f"make test-{target}", shell=True)
+            check_call(f"make test-{shlex.quote(target)}", shell=True)
     finally:
         # dump a lot of info to the GHA logs
         with gha_log_group("pod and statefulset info"):
@@ -116,7 +118,7 @@ def run_tests(target: str) -> None:
             # regular logs from a running (or finished) pod
             call("kubectl logs --selector=nosuchlabel!=nosuchvalue --all-pods --timestamps", shell=True)
 
-    check_call(f"make un{deploy}-{deploy_target}", shell=True)
+    check_call(f"make {shlex.quote(f'un{deploy}-{deploy_target}')}", shell=True)
 
     print(f"[INFO] Finished testing {target}")
 
@@ -140,13 +142,21 @@ def execute(executor: typing.Callable, args: tuple, kwargs: dict) -> int:
     return result
 
 
+def _make_just_print(target: str) -> str:
+    return subprocess.check_output([MAKE, target, "--just-print"], encoding="utf-8", cwd=PROJECT_ROOT)
+
+
+# Heavy images (e.g. datascience, trustyai) need more time to become Ready on constrained nodes.
+_HEAVY_TARGETS = ("jupyter-datascience", "jupyter-trustyai")
+
+
 # TODO(jdanek) this is a dumb impl, needs to be improved
-def wait_for_stability(pod: str) -> None:
+def wait_for_stability(pod: str, target: str = "") -> None:
     """Waits for the pod to be stable. Often I'm seeing that the probes initially fail.
     > error: Internal error occurred: error executing command in container: container is not created or running
     > error: unable to upgrade connection: container not found ("notebook")
     """
-    timeout = 100
+    timeout = 200 if any(h in target for h in _HEAVY_TARGETS) else 100
     for _ in range(3):
         call(
             f"timeout {timeout}s bash -c 'until kubectl wait --for=condition=Ready pods --all --timeout 5s; do sleep 1; done'",
@@ -201,41 +211,29 @@ class TestMakeTest(unittest.TestCase):
         assert "make validate-codeserver-image image=codeserver-ubi9-python-3.11" in commands
         assert "make undeploy9-codeserver-ubi9-python-3.11" in commands
 
-    @unittest.mock.patch(target)
-    def test_make_commands_rstudio(self, mock_execute: unittest.mock.Mock) -> None:
-        """Compares the commands with what we had in the openshift/release yaml"""
-        run_tests("rstudio-c9s-python-3.11")
-        commands: list[str] = [c[0][1][0] for c in mock_execute.call_args_list]
-        assert "make deploy-c9s-rstudio-c9s-python-3.11" in commands
-        assert "make validate-rstudio-image image=rstudio-c9s-python-3.11" in commands
-        assert "make undeploy-c9s-rstudio-c9s-python-3.11" in commands
+    def test_make_deploy_codeserver_baseline_resolves_baseline_kustomize_dir(self) -> None:
+        output = _make_just_print("deploy9-codeserver-baseline-ubi9-python-3.12")
+        assert "codeserver-baseline/ubi9-python-3.12/kustomize/base/kustomization.yaml" in output, output
 
-    @unittest.mock.patch(target)
-    def test_make_commands_rsudio_rhel(self, mock_execute: unittest.mock.Mock) -> None:
-        """Compares the commands with what we had in the openshift/release yaml"""
-        run_tests("rstudio-rhel9-python-3.11")
-        commands: list[str] = [c[0][1][0] for c in mock_execute.call_args_list]
-        assert "make deploy-rhel9-rstudio-rhel9-python-3.11" in commands
-        assert "make validate-rstudio-image image=rstudio-rhel9-python-3.11" in commands
-        assert "make undeploy-rhel9-rstudio-rhel9-python-3.11" in commands
+    def test_make_undeploy_codeserver_baseline_resolves_baseline_kustomize_dir(self) -> None:
+        output = _make_just_print("undeploy9-codeserver-baseline-ubi9-python-3.12")
+        assert "codeserver-baseline/ubi9-python-3.12/kustomize/base" in output, output
 
-    @unittest.mock.patch(target)
-    def test_make_commands_cuda_rstudio(self, mock_execute: unittest.mock.Mock) -> None:
-        """Compares the commands with what we had in the openshift/release yaml"""
-        run_tests("cuda-rstudio-c9s-python-3.11")
-        commands: list[str] = [c[0][1][0] for c in mock_execute.call_args_list]
-        assert "make deploy-c9s-rstudio-c9s-python-3.11" in commands
-        assert "make validate-rstudio-image image=cuda-rstudio-c9s-python-3.11" in commands
-        assert "make undeploy-c9s-rstudio-c9s-python-3.11" in commands
+    def test_make_deploy_jupyter_baseline_resolves_baseline_kustomize_dir(self) -> None:
+        output = _make_just_print("deploy9-jupyter-baseline-ubi9-python-3.12")
+        assert "jupyter/baseline/ubi9-python-3.12/kustomize/base/kustomization.yaml" in output, output
 
-    @unittest.mock.patch(target)
-    def test_make_commands_cuda_rstudio_rhel(self, mock_execute: unittest.mock.Mock) -> None:
-        """Compares the commands with what we had in the openshift/release yaml"""
-        run_tests("cuda-rstudio-rhel9-python-3.11")
-        commands: list[str] = [c[0][1][0] for c in mock_execute.call_args_list]
-        assert "make deploy-rhel9-rstudio-rhel9-python-3.11" in commands
-        assert "make validate-rstudio-image image=cuda-rstudio-rhel9-python-3.11" in commands
-        assert "make undeploy-rhel9-rstudio-rhel9-python-3.11" in commands
+    def test_make_undeploy_jupyter_baseline_resolves_baseline_kustomize_dir(self) -> None:
+        output = _make_just_print("undeploy9-jupyter-baseline-ubi9-python-3.12")
+        assert "jupyter/baseline/ubi9-python-3.12/kustomize/base" in output, output
+
+    def test_make_deploy_runtime_baseline_resolves_baseline_kustomize_dir(self) -> None:
+        output = _make_just_print("deploy9-runtimes-baseline-ubi9-python-3.12")
+        assert "runtimes/baseline/ubi9-python-3.12/kustomize/base/kustomization.yaml" in output, output
+
+    def test_make_undeploy_runtime_baseline_resolves_baseline_kustomize_dir(self) -> None:
+        output = _make_just_print("undeploy9-runtimes-baseline-ubi9-python-3.12")
+        assert "runtimes/baseline/ubi9-python-3.12/kustomize/base" in output, output
 
     @unittest.mock.patch(target)
     def test_make_commands_runtime(self, mock_execute: unittest.mock.Mock) -> None:
@@ -272,6 +270,19 @@ class TestMakeTest(unittest.TestCase):
         assert "make deploy9-runtimes-cuda-pytorch+llmcompressor-ubi9-python-3.12" in commands
         assert "make validate-runtime-image image=runtime-cuda-pytorch-llmcompressor-ubi9-python-3.12" in commands
         assert "make undeploy9-runtimes-cuda-pytorch+llmcompressor-ubi9-python-3.12" in commands
+
+    def test_rejects_invalid_target_characters(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Invalid target"):
+            run_tests("bad;target")
+
+    def test_rejects_invalid_derived_namespace(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Invalid Kubernetes namespace"):
+            run_tests("bad_target")
+
+    def test_rejects_overlong_derived_namespace(self) -> None:
+        """Namespace is 'ns-' + target (dots→dashes), so 'a'*61 gives 64 chars — one over the 63-char DNS-1123 limit."""
+        with self.assertRaisesRegex(ValueError, "Invalid Kubernetes namespace"):
+            run_tests("a" * 61)
 
 
 if __name__ == "__main__":

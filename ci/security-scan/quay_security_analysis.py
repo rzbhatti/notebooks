@@ -21,8 +21,6 @@ IMAGES_MAIN = [
     "odh-tensorflow-gpu-notebook-image-main",
     "odh-trustyai-notebook-image-main",
     "odh-codeserver-notebook-image-main",
-    "odh-rstudio-notebook-image-main",
-    "odh-rstudio-gpu-notebook-image-main",
 ]
 
 IMAGES = [
@@ -37,8 +35,6 @@ IMAGES = [
     "odh-runtime-tensorflow-notebook-image-n",
     "odh-workbench-jupyter-trustyai-cpu-py311-ubi9-n",
     "odh-workbench-codeserver-datascience-cpu-py311-ubi9-n",
-    "odh-workbench-rstudio-minimal-cpu-py311-c9s-n",
-    "odh-workbench-rstudio-minimal-cuda-py311-c9s-n",
 ]
 
 IMAGES_N_1 = [
@@ -53,8 +49,6 @@ IMAGES_N_1 = [
     "odh-runtime-tensorflow-notebook-image-n-1",
     "odh-workbench-jupyter-trustyai-cpu-py311-ubi9-n-1",
     "odh-workbench-codeserver-datascience-cpu-py311-ubi9-n-1",
-    "odh-workbench-rstudio-minimal-cpu-py311-c9s-n-1",
-    "odh-workbench-rstudio-minimal-cuda-py311-c9s-n-1",
 ]
 
 
@@ -80,7 +74,6 @@ def process_image(image, commit_id_path, release_version_n, hash_n):
         f'skopeo inspect docker://{img} | jq \'.Env[] | select(startswith("OPENSHIFT_BUILD_NAME=")) | split("=")[1]\''
     )
     src_tag = subprocess.check_output(src_tag_cmd, shell=True, text=True).strip().strip('"').replace("-amd64", "")
-
     regex = ""
 
     if release_version_n == "":
@@ -90,10 +83,8 @@ def process_image(image, commit_id_path, release_version_n, hash_n):
 
     latest_tag_cmd = f"skopeo inspect docker://{img} | jq -r --arg regex \"{regex}\" '.RepoTags | map(select(. | test($regex))) | .[0]'"
     latest_tag = subprocess.check_output(latest_tag_cmd, shell=True, text=True).strip()
-
     digest_cmd = f"skopeo inspect docker://{registry}:{latest_tag} | jq .Digest | tr -d '\"'"
     digest = subprocess.check_output(digest_cmd, shell=True, text=True).strip()
-
     if digest is None or digest == "":
         return
 
@@ -103,7 +94,7 @@ def process_image(image, commit_id_path, release_version_n, hash_n):
 
     url = f"https://quay.io/api/v1/repository/opendatahub/workbench-images/manifest/sha256:{sha_}/security"
 
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     data = response.json()
 
     vulnerabilities = []
@@ -111,7 +102,7 @@ def process_image(image, commit_id_path, release_version_n, hash_n):
     for feature in data["data"]["Layer"]["Features"]:
         if len(feature["Vulnerabilities"]) > 0:
             for vulnerability in feature["Vulnerabilities"]:
-                vulnerabilities.append(vulnerability)  # noqa: PERF402 Use `list` or `list.copy` to create a copy of a list
+                vulnerabilities.append(vulnerability)  # ruff: ignore[manual-list-copy] Use `list` or `list.copy` to create a copy of a list
 
     severity_levels = [entry.get("Severity", "Unknown") for entry in vulnerabilities]
     severity_counts = Counter(severity_levels)

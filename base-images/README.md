@@ -1,0 +1,118 @@
+# Base Images
+
+Foundation layer for **ODH** (Open Data Hub) workbenches and runtimes.
+All images are **CentOS Stream 9** (c9s) with **Python 3.12**.
+
+> **RHOAI** (Red Hat OpenShift AI) workbenches and runtimes use
+> **RHEL 9.8 EUS** base images from [AIPCC](https://gitlab.com/redhat/rhel-ai/core/base-images/app),
+> not these c9s images.
+
+## OS version policy (EL9 only)
+
+This repository builds on **Enterprise Linux 9 only**. ODH `base-images/` and ODH
+workbench/runtime builds use CentOS Stream 9 (`stream9`, `c9s`) via
+`quay.io/opendatahub/odh-base-image-*-py312-c9s`. RHOAI/Konflux builds use RHEL
+9.8 EUS (AIPCC) via `quay.io/aipcc/base-images/*-el9.8`. The `ubi9-python-*`
+directory names denote EL9 compatibility; they are not `FROM ubi9` bases.
+Accidental upgrades to stream10, ubi10, or rhel10 are out of scope until explicitly planned.
+
+Pin OS `FROM` references with an explicit tag and digest — for example
+`quay.io/centos/centos:stream9@sha256:…`. Digest-only refs (without a tag) let
+Renovate/MintMaker follow the registry default tag, which can jump to stream10.
+Tag bumps for `quay.io/centos/centos` are blocked by `allowedVersions` in
+[`.github/renovate.json5`](../.github/renovate.json5); digest refreshes within
+`stream9` remain allowed.
+
+## PQC crypto policy
+
+Post-quantum crypto is required for OCP 5.0 (RHOAI 3.6+, tracked in
+RHOAIENG-84389). Every Dockerfile in `base-images/` runs
+`update-crypto-policies --set DEFAULT:PQ` as root — C9S carries the RHEL 9.8 PQ
+profile, and RHEL 10 will enable PQ by default. ODH workbench/runtime images
+inherit the policy from these bases.
+
+The same policy line is required in any image Dockerfile whose base does not
+already ship PQC (for example AIPCC bases before `3.6.0-ea.2`). ODH baseline
+workbench/runtime images inherit PQC from these bases via `cpu.conf`. Coverage
+is enforced by `test_dockerfiles_pqc_crypto_policy_coverage` in
+[`tests/test_main.py`](../tests/test_main.py).
+
+## Layout
+
+| Directory | Purpose |
+|---|---|
+| `cpu/` | CPU-only base image |
+| `cuda/` | NVIDIA CUDA (12.9, 13.0) |
+| `rocm/` | AMD ROCm (6.4, 7.14) |
+| `build-args/` | `.conf` files with `INDEX_URL` per variant |
+| `utils/` | Shared scripts: `aipcc.sh`, `dnf-helper.sh`, `fix-permissions`, `pip.conf.in`, `uv.toml.in` |
+| `copr/` | Tool to rebuild Fedora SRPMs for EL9 ([README](copr/README.md)) |
+
+## How Base Images Are Consumed
+
+Downstream Dockerfiles reference base images via build arg:
+
+    ARG BASE_IMAGE
+    FROM ${BASE_IMAGE}
+
+Resolved at build time by Tekton / Konflux pipelines.
+
+## Building Locally
+
+Base images are **not in the Makefile** -- they are built by Tekton/Konflux
+pipelines only. To build locally, invoke `podman build` directly.
+Build context is the **repo root** (Dockerfiles use `COPY base-images/utils/...`):
+
+    podman build \
+      --build-arg-file=base-images/build-args/cpu.conf \
+      -f base-images/cpu/c9s-python-3.12/Dockerfile.cpu .
+
+## Python Versions and RHEL Lifecycle
+
+Red Hat ships **2 out of every 3** CPython releases in AppStream, skipping the
+version released ~6 months before the next RHEL major (*3.10* was skipped for
+RHEL 9, *3.13* for RHEL 10).
+
+| RHEL | Default (full-life) | AppStream | Skipped |
+|---|---|---|---|
+| **9** | 3.9 | 3.11 (9.2, retires May 2026), **3.12** (9.4, retires Apr 2027) | 3.10 |
+| **10** | **3.12** | *3.14 arriving via z-stream* | 3.13 |
+
+- **Python 3.13** is EPEL-only, not in RHEL AppStream
+- **Python 3.14** is in CentOS Stream 9/10 and shipping to RHEL 9.8 / 10.2
+
+> **This repo ships Python 3.12**, aligned with both RHEL 9 AppStream
+> (supported until Apr 2027) and RHEL 10 full-life. The next version to
+> consider is **3.14** (3.13 was skipped). The AIPCC wheel builder already
+> has CI for 3.14 ([AIPCC-8168](https://redhat.atlassian.net/browse/AIPCC-8168)).
+
+References:
+- [RHEL Application Streams Life Cycle](https://access.redhat.com/support/policy/updates/rhel-app-streams-life-cycle)
+- [RHEL 9 ABI Compatibility](https://access.redhat.com/articles/rhel9-abi-compatibility)
+- [RHEL Life Cycle / Errata Policy](https://access.redhat.com/support/policy/updates/errata)
+
+## Adding a New Accelerator Version
+
+> **NOTE (midstream migration):** Since [opendatahub-io/notebooks#3678](https://github.com/opendatahub-io/notebooks/pull/3678),
+> ODH CUDA/ROCm c9s base images layer on [opendatahub-io/base-containers](https://github.com/opendatahub-io/base-containers)
+> midstream images (`odh-midstream-cuda-base-*`, `odh-midstream-rocm-base-*`) instead of installing
+> GPU packages in-tree. For routine SDK bumps: pick the matching midstream tag, digest-pin the `FROM`,
+> and open the SDK/repo change against **base-containers** first.
+>
+> The steps below describe the **legacy in-repo workflow** (vendor Dockerfiles, `cuda-repos/`, GPG keys).
+> We keep them on purpose — we should not be helplessly beholden to midstream alone, and contributors
+> should retain knowledge of how to build accelerator bases here. See #3678 for the last implementation
+> of that approach before the migration.
+
+The CUDA and ROCm Dockerfiles are adapted from upstream vendor references:
+
+- **CUDA**: [gitlab.com/nvidia/container-images/cuda](https://gitlab.com/nvidia/container-images/cuda) (see `dist/<version>/ubi9/` for base, runtime, and cudnn stages)
+- **ROCm**: [github.com/ROCm/ROCm-docker](https://github.com/ROCm/ROCm-docker) and [ROCm install docs](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/post-install.html)
+
+Steps:
+
+1. Copy an existing version directory (e.g. `cuda/12.9/` -> `cuda/13.1/`)
+2. Update the Dockerfile stages from the upstream vendor Dockerfiles for the new SDK version
+3. Update `cuda-repos/` repo files if needed (GPG keys, baseurls)
+4. Create `build-args/<variant>.conf` with the correct `INDEX_URL`
+5. Add Tekton pipeline YAMLs in `.tekton/`

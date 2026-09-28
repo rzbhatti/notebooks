@@ -23,22 +23,27 @@ def exec_makefile(target: str, makefile_dir: pathlib.Path | str, options: Sequen
     else:
         make_command = "make"
 
+    cmd = [make_command, *options, target]
     try:
         # Run the make (or gmake) command and capture the output
         result = subprocess.run(
-            [make_command, *options, target],
+            cmd,
             capture_output=True,
             text=True,
             check=True,
             cwd=makefile_dir,
         )
     except subprocess.CalledProcessError as e:
-        # Handle errors if the make command fails
-        print(f"{make_command} failed with return code: {e.returncode}:\n{e.stderr}", file=sys.stderr)
+        print(
+            f"Command {cmd!r} in {makefile_dir!r} failed with return code {e.returncode}:\n{e.stderr}",
+            file=sys.stderr,
+        )
         raise
     except Exception as e:
-        # Handle any other exceptions
-        print(f"Error occurred attempting to parse Makefile:\n{e!s}", file=sys.stderr)
+        print(
+            f"Error executing command {cmd!r} in {makefile_dir!r}:\n{e!s}",
+            file=sys.stderr,
+        )
         raise
 
     return result.stdout
@@ -61,29 +66,36 @@ class TestMakefile:
     MINIMAL_IMAGE = "jupyter-minimal-ubi9-python-3.12"
 
     def test_makefile__build_image__konflux(self):
-        konflux_default = dry_run_makefile(target=self.MINIMAL_IMAGE, makefile_dir=PROJECT_ROOT)
-        konflux_yes = dry_run_makefile(target=self.MINIMAL_IMAGE, makefile_dir=PROJECT_ROOT, env={"KONFLUX": "yes"})
+        import ntb  # ruff: ignore[import-outside-top-level] `import` should be at the top-level of a file
 
-        _assert_subdict(
-            {
-                "VARIANT": "cpu",
-                "DOCKERFILE_NAME": "Dockerfile.cpu",
-                "CONF_FILE": "jupyter/minimal/ubi9-python-3.12/build-args/cpu.conf",
-            },
-            _extract_assignments(konflux_default),
-        )
+        minimal_image_dir = "jupyter/minimal/ubi9-python-3.12/"
 
-        _assert_subdict(
+        product_default = dry_run_makefile(target=self.MINIMAL_IMAGE, makefile_dir=PROJECT_ROOT)
+        product_rhoai = dry_run_makefile(target=self.MINIMAL_IMAGE, makefile_dir=PROJECT_ROOT, env={"PRODUCT": "rhoai"})
+
+        ntb.assert_subdict(
             {
                 "VARIANT": "cpu",
                 "DOCKERFILE_NAME": "Dockerfile.konflux.cpu",
-                "CONF_FILE": "jupyter/minimal/ubi9-python-3.12/build-args/konflux.cpu.conf",
+                "CONF_FILE": (minimal_image_dir + "build-args/cpu.conf"),
             },
-            _extract_assignments(konflux_yes),
+            _extract_assignments(product_default),
         )
+        assert f"--file '{minimal_image_dir + 'Dockerfile.konflux.cpu'}'" in product_default
+        assert f"with {minimal_image_dir + 'build-args/cpu.conf'}" in product_default
+        assert "--build-arg 'PRODUCT=odh'" in product_default
 
-        assert "--file 'jupyter/minimal/ubi9-python-3.12/Dockerfile.cpu'" in konflux_default
-        assert "--file 'jupyter/minimal/ubi9-python-3.12/Dockerfile.konflux.cpu'" in konflux_yes
+        ntb.assert_subdict(
+            {
+                "VARIANT": "cpu",
+                "DOCKERFILE_NAME": "Dockerfile.konflux.cpu",
+                "CONF_FILE": (minimal_image_dir + "build-args/konflux.cpu.conf"),
+            },
+            _extract_assignments(product_rhoai),
+        )
+        assert f"--file '{minimal_image_dir + 'Dockerfile.konflux.cpu'}'" in product_rhoai
+        assert f"with {minimal_image_dir + 'build-args/konflux.cpu.conf'}" in product_rhoai
+        assert "--build-arg 'PRODUCT=rhoai'" in product_rhoai
 
 
 def _extract_assignments(makefile_output: str) -> dict[str, str]:
@@ -99,10 +111,3 @@ def _extract_assignments(makefile_output: str) -> dict[str, str]:
         key, value = line.split(":=", 1)
         assignments[key.strip()] = value.strip()
     return assignments
-
-
-# see also https://pypi.org/project/pytest-assert-utils/
-def _assert_subdict(subdict: dict[str, str], superdict: dict[str, str]):
-    """Filter subdict to only keys in superdict, then compare the remaining items."""
-    __tracebackhide__ = True
-    assert subdict == {k: superdict[k] for k in subdict if k in superdict}

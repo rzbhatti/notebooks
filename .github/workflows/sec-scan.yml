@@ -16,22 +16,21 @@ env:
   RELEASE_VERSION_N_1: 2023a
 jobs:
   initialize:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
-      - name: Install Skopeo CLI
-        shell: bash
-        run: |
-          sudo apt-get -y update
-          sudo apt-get -y install skopeo
-
       # Checkout the branch
       - name: Checkout branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ env.BRANCH_NAME }}
           persist-credentials: true
+
+      - name: Install Skopeo CLI
+        uses: ./.github/actions/apt-install
+        with:
+          packages: skopeo
 
       # Create a new branch
       - name: Create a new branch
@@ -42,7 +41,7 @@ jobs:
 
   check-vulnerabilities:
     needs: [initialize]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       contents: write
     steps:
@@ -53,7 +52,7 @@ jobs:
 
       # Get the latest weekly build commit hash: https://github.com/opendatahub-io/notebooks/commits/2023b
       - name: Checkout upstream notebooks repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: opendatahub-io/notebooks.git
           ref: ${{ env.RELEASE_VERSION_N }}
@@ -65,7 +64,7 @@ jobs:
           echo "HASH_N=$(git rev-parse --short HEAD)" >> ${GITHUB_OUTPUT}
 
       - name: Checkout "N - 1" branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: opendatahub-io/notebooks.git
           ref: ${{ env.RELEASE_VERSION_N_1 }}
@@ -77,7 +76,7 @@ jobs:
           echo "HASH_N_1=$(git rev-parse --short HEAD)" >> ${GITHUB_OUTPUT}
 
       - name: Checkout "main" branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           repository: opendatahub-io/notebooks.git
           ref: main
@@ -90,13 +89,13 @@ jobs:
 
       # Checkout the release branch to apply the updates
       - name: Checkout release branch
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ env.SEC_SCAN_BRANCH }}
           persist-credentials: true
 
       - name: setup python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: '.python-version'
 
@@ -123,28 +122,35 @@ jobs:
   # Creates the Pull Request
   open-pull-request:
     needs: [check-vulnerabilities]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     permissions:
       pull-requests: write
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v6
-
-      - name: pull-request
-        uses: repo-sync/pull-request@v2
-        with:
-          source_branch: ${{ env.SEC_SCAN_BRANCH }}
-          destination_branch: ${{ env.BRANCH_NAME}}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          pr_label: "automated pr"
-          pr_title: "[Security Scanner Action] Weekly update of security vulnerabilities reported by Quay"
-          pr_body: |
+      - name: Create pull request
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_TITLE: "[Security Scanner Action] Weekly update of security vulnerabilities reported by Quay"
+          PR_BODY: |
             :rocket: This is an automated Pull Request.
 
             This PR updates:
 
             * `ci/security-scan/security_scan_results.md` file with the latest security vulnerabilities reported by Quay.
             * `ci/security-scan/weekly_commit_ids` with the latest updated SHA digests of the notebooks (N & N-1)
-            Created by `/.github/workflows/sec-scan.yaml`
+            Created by `/.github/workflows/sec-scan.yml`
 
-            :exclamation: **IMPORTANT NOTE**: Remember to delete the ` ${{ env.SEC_SCAN_BRANCH }}` branch after merging the changes
+            :exclamation: **IMPORTANT NOTE**: Remember to delete the `${{ env.SEC_SCAN_BRANCH }}` branch after merging the changes
+        run: |
+          gh label create "automated pr" \
+            --repo "$GITHUB_REPOSITORY" \
+            --description "Pull requests created by automation" \
+            --color "ededed" \
+            2>/dev/null || true
+
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "${{ env.SEC_SCAN_BRANCH }}" \
+            --base "${{ env.BRANCH_NAME }}" \
+            --title "$PR_TITLE" \
+            --body "$PR_BODY" \
+            --label "automated pr"

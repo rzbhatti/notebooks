@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from os import PathLike
 
-    import pytest_subtests
+    import pytest
     from pyfakefs.fake_filesystem import FakeFilesystem
 
 
@@ -76,7 +76,7 @@ def process_template_with_indents(template: templatelib.Template) -> str:
 
 
 class TestProcessTemplateWithIndents:
-    def test_process_template_with_indents(self, subtests: pytest_subtests.plugin.SubTests) -> None:
+    def test_process_template_with_indents(self, subtests: pytest.Subtests) -> None:
         a = "a\na"
         b = "b\n b"
         test_cases = [
@@ -92,11 +92,11 @@ class TestProcessTemplateWithIndents:
 
 
 def blockinfile(
-        filename: str | PathLike,
-        contents: str,
-        prefix: str | None = None,
-        *,
-        comment: str = "#",
+    filename: str | PathLike,
+    contents: str,
+    prefix: str | None = None,
+    *,
+    comment: str = "#",
 ) -> None:
     """This is similar to the functions in
     * https://homely.readthedocs.io/en/latest/ref/files.html#homely-files-blockinfile-1
@@ -130,11 +130,18 @@ def blockinfile(
     new_contents = contents.lstrip("\n").splitlines(keepends=True)
     if new_contents and new_contents[-1] == "\n":
         new_contents = new_contents[:-1]
+    # Hadolint fails with "unexpected '#' expecting a new line followed by the
+    # next instruction" when ### END sits immediately after a HEREDOC terminator.
+    # Fragments that close the string on the same line as EOF (`EOF"""`) have no
+    # trailing newline, so the `\n` before end_marker would otherwise only
+    # terminate the EOF line instead of inserting a blank line.
+    if new_contents and new_contents[-1].rstrip("\n") == "EOF":
+        new_contents[-1] = "EOF\n"
     if begin == end == -1:
         # no markers found
         return
     else:
-        lines[begin: end + 1] = [f"{begin_marker}\n", *new_contents, f"\n{end_marker}\n"]
+        lines[begin : end + 1] = [f"{begin_marker}\n", *new_contents, f"\n{end_marker}\n"]
 
     if lines == original_lines:
         return
@@ -164,3 +171,13 @@ class TestBlockinfile:
         blockinfile("/config.txt", "key=value\n\n")
 
         assert fs.get_object("/config.txt").contents == "hello\nworld\n### BEGIN\nkey=value\n\n### END\n"
+
+    def test_heredoc_eof_gets_blank_line_before_end(self, fs: FakeFilesystem):
+        """Hadolint requires a blank line after a Dockerfile HEREDOC terminator."""
+        fs.create_file("/Dockerfile", contents="FROM x\n### BEGIN frag\n### END frag\n")
+
+        blockinfile("/Dockerfile", "RUN <<'EOF'\necho hi\nEOF", prefix="frag")
+
+        assert fs.get_object("/Dockerfile").contents == (
+            "FROM x\n### BEGIN frag\nRUN <<'EOF'\necho hi\nEOF\n\n### END frag\n"
+        )

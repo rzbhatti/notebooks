@@ -3,25 +3,40 @@ set -euo pipefail
 
 # prefetch-all.sh — Download all hermetic build dependencies for a component.
 #
-# Orchestrates generating lockfiles and downloading all dependency types
-# (generic artifacts, pip wheels, npm packages, RPMs) into
-# cachi2/output/deps/ for local and CI hermetic builds.
-# Delegates to the four main lockfile-generator scripts with --download.
+# Hermetic builds (Konflux/Tekton and local) require every dependency to be
+# prefetched so the Dockerfile can build fully offline (no network access).
+# This script orchestrates downloading all five dependency types:
 #
-# After running this script, `make <target>` will auto-detect cachi2/output/
-# and pass --volume + --build-arg LOCAL_BUILD=true to podman build.
+#   1. Generic artifacts — GPG keys, nfpm-built RPMs, Node.js headers,
+#      Electron binaries, VS Code .vsix (into cachi2/output/deps/generic/).
+#      Component-specific: codeserver gets ripgrep from pip, oc from RPM.
+#   2. Pip wheels — Python packages resolved from pyproject.toml
+#      (into cachi2/output/deps/pip/).
+#   3. NPM packages — tarballs resolved from package-lock.json files
+#      (into cachi2/output/deps/npm/).
+#   4. RPMs — system packages resolved from rpms.lock.yaml via Hermeto
+#      (into cachi2/output/deps/rpm/).
+#   5. Go modules — Go deps from go.mod/go.sum via Hermeto (gomod)
+#      (into cachi2/output/deps/gomod/).
+#
+# Each step is skipped if its input file is not present in the component's
+# prefetch-input/<variant>/ directory. Step 3 (NPM) discovers the Tekton
+# file via find_tekton_yaml (RHDS = Dockerfile.konflux.*, ODH = Dockerfile.*). No Tekton file → skip npm.
+#
+# After running this script, `make <target>` auto-detects cachi2/output/
+# and passes --volume to podman build.
 #
 # Usage:
-#   # Basic — upstream ODH (CentOS Stream base, no subscription):
+#   # Upstream ODH (CentOS Stream base, no subscription):
 #   ./scripts/lockfile-generators/prefetch-all.sh \
 #       --component-dir codeserver/ubi9-python-3.12
 #
-#   # Downstream RHDS (uses RHEL subscription repos):
+#   # Downstream RHDS (RHEL base, requires subscription for RPMs):
 #   ./scripts/lockfile-generators/prefetch-all.sh \
 #       --component-dir codeserver/ubi9-python-3.12 --rhds \
 #       --activation-key my-key --org my-org
 #
-#   # Custom flavor:
+#   # Custom flavor (e.g. cuda, rocm):
 #   ./scripts/lockfile-generators/prefetch-all.sh \
 #       --component-dir codeserver/ubi9-python-3.12 --flavor cuda
 #
@@ -30,9 +45,8 @@ set -euo pipefail
 SCRIPTS_PATH="scripts/lockfile-generators"
 
 COMPONENT_DIR=""
-VARIANT="odh"
-FLAVOR="cpu"
-TEKTON_FILE=""
+VARIANT="odh"       # "odh" = upstream (CentOS Stream), "rhds" = downstream (RHEL)
+FLAVOR="cpu"        # selects which pylock/requirements files to use (cpu, cuda, rocm)
 ACTIVATION_KEY=""
 ORG=""
 
@@ -47,11 +61,13 @@ Options:
                           e.g. codeserver/ubi9-python-3.12
   --rhds                  Use downstream (RHDS) lockfiles instead of upstream (ODH)
   --flavor NAME           Lock file flavor (default: cpu)
-  --tekton-file FILE      Tekton PipelineRun YAML for npm path discovery
-                          (auto-detected from .tekton/ if omitted)
   --activation-key KEY    Red Hat activation key for RHEL RPMs (optional)
   --org ORG               Red Hat organization ID for RHEL RPMs (optional)
   -h, --help              Show this help
+
+Environment variables (preferred in CI to avoid leaking secrets):
+  SUBSCRIPTION_ACTIVATION_KEY   Same as --activation-key
+  SUBSCRIPTION_ORG              Same as --org
 HELPEOF
 }
 
@@ -60,12 +76,43 @@ error_exit() {
   exit 1
 }
 
-# --- Validation ---
+# find_tekton_yaml COMPONENT_DIR VARIANT
+# Finds .tekton/*pull-request*.yaml files that build this component for the
+# given variant by matching the pipeline's dockerfile param. Requires yq;
+# must be run from repo root.
+#
+#   ODH (upstream):  dockerfile is COMPONENT_DIR/Dockerfile.* (excludes Dockerfile.konflux.*).
+#   RHDS (downstream): dockerfile is COMPONENT_DIR/Dockerfile.konflux.*
+# Outputs matching file paths one per line. Returns 0 if at least one match.
+find_tekton_yaml() {
+  local comp_dir="$1"
+  local variant="$2"
+  local found=0
+  local f dockerfile_path
+  if [[ ! -d ".tekton" ]] || ! command -v yq &>/dev/null; then
+    return 1
+  fi
+  for f in .tekton/*pull-request*.yaml; do
+    [[ -f "$f" ]] || continue
+    dockerfile_path=$(yq -r '.spec.params[] | select(.name == "dockerfile") | .value' "$f" 2>/dev/null)
+    [[ -n "$dockerfile_path" ]] || continue
+    if [[ "$variant" == "odh" ]] || [[ "$variant" == "rhds" ]]; then
+      if [[ "$dockerfile_path" == "$comp_dir/Dockerfile.konflux."* ]]; then
+        echo "$f"
+        found=1
+      fi
+    fi
+  done
+  [[ $found -eq 1 ]]
+}
+
+# Must run from the repo root because all paths (lockfiles, Tekton YAMLs,
+# Dockerfiles) are relative to it.
 if [[ ! -d "$SCRIPTS_PATH" ]]; then
   error_exit "This script must be run from the repository root."
 fi
 
-# --- Argument Parsing ---
+# --- Argument parsing ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --component-dir)     [[ $# -ge 2 ]] || error_exit "--component-dir requires a value"
@@ -73,8 +120,6 @@ while [[ $# -gt 0 ]]; do
     --rhds)              VARIANT="rhds"; shift ;;
     --flavor)            [[ $# -ge 2 ]] || error_exit "--flavor requires a value"
                          FLAVOR="$2"; shift 2 ;;
-    --tekton-file)       [[ $# -ge 2 ]] || error_exit "--tekton-file requires a value"
-                         TEKTON_FILE="$2"; shift 2 ;;
     --activation-key)    [[ $# -ge 2 ]] || error_exit "--activation-key requires a value"
                          ACTIVATION_KEY="$2"; shift 2 ;;
     --org)               [[ $# -ge 2 ]] || error_exit "--org requires a value"
@@ -87,13 +132,58 @@ done
 [[ -z "$COMPONENT_DIR" ]] && error_exit "--component-dir is required."
 [[ -d "$COMPONENT_DIR" ]] || error_exit "Component directory not found: $COMPONENT_DIR"
 
+# CLI args take priority; fall back to env vars so GHA can pass secrets
+# without exposing them on the command line.  GitHub Actions masks env var
+# values in logs, but command-line args appear in process listings.
+ACTIVATION_KEY="${ACTIVATION_KEY:-${SUBSCRIPTION_ACTIVATION_KEY:-}}"
+ORG="${ORG:-${SUBSCRIPTION_ORG:-}}"
+
+# Activation key and org must be provided together — one without the other
+# is always a mistake (subscription-manager needs both to register).
 if [[ -n "$ACTIVATION_KEY" && -z "$ORG" ]] || [[ -z "$ACTIVATION_KEY" && -n "$ORG" ]]; then
-  error_exit "--activation-key and --org must be provided together."
+  error_exit "--activation-key/--org (or SUBSCRIPTION_ACTIVATION_KEY/SUBSCRIPTION_ORG env vars) must be provided together."
 fi
 
+# Export secrets as env vars so child scripts (hermeto-fetch-rpm.sh,
+# create-rpm-lockfile.sh) inherit them automatically.  This avoids passing
+# secrets as command-line arguments, which would be visible in `ps` output
+# and shell traces (`set -x`).
+if [[ -n "$ACTIVATION_KEY" ]]; then
+  export SUBSCRIPTION_ACTIVATION_KEY="$ACTIVATION_KEY"
+  export SUBSCRIPTION_ORG="$ORG"
+fi
+
+# --- Variant selection ---
+# Each component uses COMPONENT_DIR/prefetch-input when present; Jupyter
+# notebook dirs that share upstream RPM/generic locks use repo-root
+# prefetch-input/ (no symlink — Konflux Hermeto rejects symlink path segments
+# for git submodule resolution). Under that: odh/ (upstream, CentOS Stream
+# packages) and optionally rhds/ (downstream, RHEL). The variant determines
+# which lockfiles are used for all four steps.
+#
+# In GHA CI, the template passes --rhds explicitly for subscription builds;
+# secrets are globally available so auto-detection would wrongly switch ODH
+# builds to RHDS, contaminating the layer cache (see #3256).
+# For standalone/local use, auto-detect from credentials when not in CI.
 PREFETCH_DIR="$COMPONENT_DIR/prefetch-input"
+if [[ ! -d "$PREFETCH_DIR" ]] && [[ -d prefetch-input ]]; then
+  # Check if any Dockerfile in the component dir references repo-root prefetch-input/.
+  # This catches components whose symlinks were removed (Konflux Hermeto rejects
+  # symlink segments in git submodule paths) but whose Dockerfiles still use
+  # COPY prefetch-input/... relative to the repo-root build context.
+  if grep -rq 'prefetch-input/' "$COMPONENT_DIR"/Dockerfile* 2>/dev/null; then
+    PREFETCH_DIR="prefetch-input"
+  fi
+fi
+if [[ -z "${CI:-}" ]] && [[ "$VARIANT" == "odh" ]] && [[ -n "$ACTIVATION_KEY" ]] && [[ -d "$PREFETCH_DIR/rhds" ]]; then
+  echo "Subscription credentials provided — switching to RHDS variant"
+  VARIANT="rhds"
+fi
+
 VARIANT_DIR="$PREFETCH_DIR/$VARIANT"
-[[ -d "$VARIANT_DIR" ]] || error_exit "Variant directory not found: $VARIANT_DIR"
+if [[ ! -d "$VARIANT_DIR" ]]; then
+  echo "Note: Variant directory not found ($VARIANT_DIR). Steps 1 and 4 (generic, RPM) will be skipped if their inputs are missing."
+fi
 
 echo "=============================================="
 echo " prefetch-all.sh"
@@ -110,137 +200,188 @@ STEPS_SKIPPED=0
 
 # =========================================================================
 # Step 1: Generic artifacts (create-artifact-lockfile.py)
-# Generates artifacts.lock.yaml and downloads GPG keys, nfpm RPMs, node
-# headers, electron binaries, etc. into cachi2/output/deps/generic/.
+#
+# Downloads non-package artifacts listed in artifacts.in.yaml: GPG keys
+# for RPM signature verification, nfpm-packaged RPMs (e.g. code-server),
+# Node.js headers for native addons, Electron binaries, etc.
+# Output: cachi2/output/deps/generic/
 # =========================================================================
 ARTIFACTS_INPUT="$VARIANT_DIR/artifacts.in.yaml"
 if [[ -f "$ARTIFACTS_INPUT" ]]; then
-  echo "=== [1/4] Generic artifacts ==="
+  echo "=== [1/5] Generic artifacts ==="
   python3 "$SCRIPTS_PATH/create-artifact-lockfile.py" \
       --artifact-input "$ARTIFACTS_INPUT"
   STEPS_RUN=$((STEPS_RUN + 1))
   echo ""
 else
-  echo "=== [1/4] Generic artifacts — SKIPPED (no $ARTIFACTS_INPUT) ==="
+  echo "=== [1/5] Generic artifacts — SKIPPED (no $ARTIFACTS_INPUT) ==="
   STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
 fi
 
 # =========================================================================
-# Step 2: Pip wheels (create-requirements-lockfile.sh --download)
-# Generates pylock.<flavor>.toml + requirements.<flavor>.txt, then
-# downloads all wheels into cachi2/output/deps/pip/.
+# Step 2: Pip wheels (download from committed requirements.<flavor>.txt)
+#
+# Download-only, like the RPM step (step 4): this script never generates
+# pip lockfiles.  GHA and Konflux (Hermeto/cachi2) must consume the same
+# committed pylock/requirements files; regenerating them here would let
+# GHA pass while Konflux fails on the stale committed locks (and vice
+# versa).  When pyproject.toml changes, regenerate with
+# `make refresh-lock-files` (or create-requirements-lockfile.sh) and
+# commit the result — prefetch only downloads.
+#
+# The --flavor flag selects which lockfile flavor to use (cpu, cuda,
+# rocm have different optional dependency groups, e.g. torch/triton).
+# Output: cachi2/output/deps/pip/
 # =========================================================================
 PYPROJECT="$COMPONENT_DIR/pyproject.toml"
 if [[ -f "$PYPROJECT" ]]; then
-  echo "=== [2/4] Pip wheels ==="
-  "$SCRIPTS_PATH/create-requirements-lockfile.sh" \
-      --pyproject-toml "$PYPROJECT" --flavor "$FLAVOR" --download
+  echo "=== [2/5] Pip wheels ==="
+  REQUIREMENTS_FILE="$COMPONENT_DIR/requirements.${FLAVOR}.txt"
+  if [[ ! -f "$REQUIREMENTS_FILE" ]]; then
+    error_exit "requirements.${FLAVOR}.txt not found in $COMPONENT_DIR. prefetch-all.sh does not generate pip lockfiles — run 'make refresh-lock-files DIR=$COMPONENT_DIR' (or scripts/lockfile-generators/create-requirements-lockfile.sh), commit the result, then re-run prefetch."
+  fi
+
+  # Derive target arch from BUILD_ARCH (GHA cross-build via QEMU) or host
+  if [[ -n "${BUILD_ARCH:-}" ]]; then
+    case "${BUILD_ARCH##*/}" in
+      amd64) ARCH="x86_64" ;;
+      arm64) ARCH="aarch64" ;;
+      *) ARCH="${BUILD_ARCH##*/}" ;;
+    esac
+  else
+    ARCH=$(uname -m)
+  fi
+
+  # Download wheels (parallel, arch-filtered)
+  python3 "$SCRIPTS_PATH/helpers/download-pip-packages.py" \
+      --arch "$ARCH" "$REQUIREMENTS_FILE"
   STEPS_RUN=$((STEPS_RUN + 1))
   echo ""
 else
-  echo "=== [2/4] Pip wheels — SKIPPED (no $PYPROJECT) ==="
+  echo "=== [2/5] Pip wheels — SKIPPED (no $PYPROJECT) ==="
   STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
 fi
 
 # =========================================================================
 # Step 3: NPM packages (download-npm.sh)
-# Downloads npm tarballs into cachi2/output/deps/npm/ by extracting
-# resolved URLs from package-lock.json files.
 #
-# Preferred: use --tekton-file (or auto-detect from .tekton/) which
-# processes all npm directories in a single pass.  Requires yq.
-# Fallback: discover package-lock.json files and process one by one.
+# Auto-detect Tekton file via find_tekton_yaml (RHDS first, then ODH). If found,
+# download npm tarballs from the prefetch-input paths listed there. If no
+# Tekton file is found for this component, skip npm. Requires yq.
+#
+# Output: cachi2/output/deps/npm/
 # =========================================================================
-echo "=== [3/4] NPM packages ==="
+echo "=== [3/5] NPM packages ==="
 
 npm_done=false
+tekton_file=""
 
-# Auto-detect tekton file if not provided
-if [[ -z "$TEKTON_FILE" ]] && [[ -d ".tekton" ]] && command -v yq &>/dev/null; then
-  auto_tekton=$(grep -rl "$COMPONENT_DIR/prefetch-input" .tekton/*pull-request*.yaml 2>/dev/null | head -1) || true
-  if [[ -n "$auto_tekton" ]]; then
-    TEKTON_FILE="$auto_tekton"
-    echo "  Auto-detected tekton file: $TEKTON_FILE"
+# Find the Tekton PipelineRun YAML for this component. Prefer the active
+# variant (matches --rhds flag), fall back to the other variant.
+if [[ -d ".tekton" ]] && command -v yq &>/dev/null; then
+  tekton_file=$(find_tekton_yaml "$COMPONENT_DIR" "$VARIANT" 2>/dev/null | head -1) || true
+  if [[ -z "$tekton_file" ]]; then
+    fallback_variant=$([[ "$VARIANT" == "rhds" ]] && echo "odh" || echo "rhds")
+    tekton_file=$(find_tekton_yaml "$COMPONENT_DIR" "$fallback_variant" 2>/dev/null | head -1) || true
   fi
-fi
-
-if [[ -n "$TEKTON_FILE" ]]; then
-  if [[ ! -f "$TEKTON_FILE" ]]; then
-    echo "  Warning: Tekton file not found: $TEKTON_FILE — falling back to auto-discovery"
-  elif ! command -v yq &>/dev/null; then
-    echo "  Warning: yq not found — falling back to auto-discovery"
-  else
-    "$SCRIPTS_PATH/download-npm.sh" --tekton-file "$TEKTON_FILE"
+  if [[ -n "$tekton_file" ]]; then
+    echo "  Auto-detected tekton file: $tekton_file"
+    "$SCRIPTS_PATH/download-npm.sh" --tekton-file "$tekton_file"
     npm_done=true
   fi
 fi
 
-if [[ "$npm_done" != true ]]; then
-  echo "  Discovering package-lock.json files under $PREFETCH_DIR..."
-  npm_count=0
-  while IFS= read -r -d '' lock; do
-    echo "  Processing: $lock"
-    "$SCRIPTS_PATH/download-npm.sh" --lock-file "$lock"
-    npm_count=$((npm_count + 1))
-  done < <(find "$PREFETCH_DIR" -not -path "*/node_modules/*" -name "package-lock.json" -print0 2>/dev/null)
-
-  if [[ $npm_count -eq 0 ]]; then
-    echo "  No package-lock.json files found — skipping npm download"
-    STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
-  else
-    echo "  Processed $npm_count package-lock.json file(s)"
-  fi
-fi
-
-if [[ "$npm_done" == true ]] || [[ ${npm_count:-0} -gt 0 ]]; then
+if [[ "$npm_done" == true ]]; then
   STEPS_RUN=$((STEPS_RUN + 1))
+else
+  echo "  No Tekton file found for this component — skipping npm download"
+  STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
 fi
 echo ""
 
 # =========================================================================
-# Step 4: RPMs (create-rpm-lockfile.sh --download)
-# Generates rpms.lock.yaml, then downloads RPM packages into
-# cachi2/output/deps/rpm/ via Hermeto, creating DNF repo metadata.
-# Requires podman (to run the hermeto and rpm-lockfile containers).
+# Step 4: RPMs (hermeto-fetch-rpm.sh or create-rpm-lockfile.sh --download)
 #
-# Optimization: if rpms.lock.yaml already exists (committed), skip the
-# lockfile regeneration and just download.  This avoids a cross-platform
-# issue where create-rpm-lockfile.sh builds an x86_64 container that
-# won't run on arm64 CI runners without QEMU.
+# Downloads OS-level RPM packages into cachi2/output/deps/rpm/ and creates
+# DNF repo metadata so the Dockerfile can `dnf install` offline.
+#
+# Two modes depending on whether rpms.lock.yaml already exists:
+#
+#   Committed lockfile (rpms.lock.yaml present): call hermeto-fetch-rpm.sh
+#   directly to download only.  This is the normal CI path — lockfiles are
+#   committed to the repo and regenerated separately.
+#
+#   No lockfile: call create-rpm-lockfile.sh --download, which first
+#   generates rpms.lock.yaml (requires building a container with
+#   rpm-lockfile-prototype), then downloads.  This path is x86_64-only
+#   because the lockfile generator container is built for that arch.
+#
+# Subscription credentials (if provided) are passed to child scripts via
+# exported env vars (SUBSCRIPTION_ACTIVATION_KEY / SUBSCRIPTION_ORG),
+# not command-line args.  hermeto-fetch-rpm.sh handles cert extraction.
+#
+# Output: cachi2/output/deps/rpm/
 # =========================================================================
 RPM_INPUT="$VARIANT_DIR/rpms.in.yaml"
 RPM_LOCKFILE="$VARIANT_DIR/rpms.lock.yaml"
 if [[ -f "$RPM_INPUT" ]]; then
-  echo "=== [4/4] RPMs ==="
+  echo "=== [4/5] RPMs ==="
   if [[ -f "$RPM_LOCKFILE" ]]; then
     echo "  rpms.lock.yaml exists — downloading RPMs only (skipping lockfile regeneration)"
-    HERMETO_ARGS=(--prefetch-dir "$VARIANT_DIR")
-    if [[ -n "$ACTIVATION_KEY" ]] && [[ -n "$ORG" ]]; then
-      HERMETO_ARGS+=(--activation-key "$ACTIVATION_KEY" --org "$ORG")
-    fi
-    "$SCRIPTS_PATH/helpers/hermeto-fetch-rpm.sh" "${HERMETO_ARGS[@]}"
+    "$SCRIPTS_PATH/helpers/hermeto-fetch-rpm.sh" --prefetch-dir "$VARIANT_DIR"
   else
     echo "  rpms.lock.yaml not found — generating lockfile and downloading"
-    RPM_ARGS=(--rpm-input "$RPM_INPUT" --download)
-    if [[ -n "$ACTIVATION_KEY" ]] && [[ -n "$ORG" ]]; then
-      RPM_ARGS+=(--activation-key "$ACTIVATION_KEY" --org "$ORG")
-    fi
-    "$SCRIPTS_PATH/create-rpm-lockfile.sh" "${RPM_ARGS[@]}"
+    "$SCRIPTS_PATH/create-rpm-lockfile.sh" --rpm-input "$RPM_INPUT" --download
   fi
   STEPS_RUN=$((STEPS_RUN + 1))
   echo ""
 else
-  echo "=== [4/4] RPMs — SKIPPED (no $RPM_INPUT) ==="
+  echo "=== [4/5] RPMs — SKIPPED (no $RPM_INPUT) ==="
   STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
 fi
 
 # =========================================================================
-# Summary
+# Step 5: Go modules (create-go-lockfile.sh)
+#
+# Prefetches Go dependencies from go.mod/go.sum via Hermeto (gomod). Uses
+# the same Tekton file as NPM to discover gomod-type prefetch-input paths.
+# Output: cachi2/output/deps/gomod/
+# =========================================================================
+echo "=== [5/5] Go modules ==="
+if [[ -n "$tekton_file" ]] && command -v yq &>/dev/null; then
+  gomod_paths=$(yq eval '
+    .spec.params[]
+    | select(.name == "prefetch-input")
+    | .value[]
+    | select(.type == "gomod")
+    | .path
+  ' "$tekton_file" 2>/dev/null) || true
+  if [[ -n "$gomod_paths" ]] && [[ "$(echo "$gomod_paths" | grep -c .)" -gt 0 ]]; then
+    "$SCRIPTS_PATH/create-go-lockfile.sh" --tekton-file "$tekton_file"
+    STEPS_RUN=$((STEPS_RUN + 1))
+  else
+    echo "  No gomod-type prefetch-input in Tekton file — skipping"
+    STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
+  fi
+else
+  echo "  No Tekton file or yq — skipping Go modules"
+  STEPS_SKIPPED=$((STEPS_SKIPPED + 1))
+fi
+echo ""
+
+# =========================================================================
+# Summary — show what ran, what was skipped, and disk usage per dep type.
 # =========================================================================
 echo "=============================================="
 echo " prefetch-all.sh complete"
-echo "  Steps run    : $STEPS_RUN"
-echo "  Steps skipped: $STEPS_SKIPPED"
+echo "  component : $COMPONENT_DIR"
+echo "  variant   : $VARIANT"
+echo "  flavor    : $FLAVOR"
+echo "  prefetch  : $PREFETCH_DIR"
+echo "  lockfiles : $VARIANT_DIR"
+echo "  tekton file: $tekton_file"
+echo "  steps run    : $STEPS_RUN"
+echo "  steps skipped: $STEPS_SKIPPED"
 echo ""
 echo " Dependencies are in: cachi2/output/deps/"
 if [[ -d "cachi2/output/deps" ]]; then
@@ -249,5 +390,5 @@ if [[ -d "cachi2/output/deps" ]]; then
 fi
 echo ""
 echo " Next: run 'make <target>' — it will auto-detect cachi2/output/"
-echo "       and mount it with LOCAL_BUILD=true."
+echo "       and mount it automatically."
 echo "=============================================="

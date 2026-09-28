@@ -1,12 +1,20 @@
+# NOTE: scripts/sandbox.py uses a limited parser that only extracts
+# single-segment directory patterns (name/ or **/name/) from this file.
+# Root-relative patterns (ci/) apply only at the repository root; **/name/
+# applies at any depth. Negation (!), globs (*.ext), and multi-segment paths
+# are ignored.
+
 bin/
 ci/
 tests/
 
 # IDE
 .idea/
+.vscode/
 
 # git
-.git/
+# .git/ is intentionally NOT ignored: the Dockerfile needs it to resolve the
+# code-server git submodule (COPY .git ...). Ensure CI uses a shallow clone.
 .gitignore
 .gitkeep
 
@@ -24,6 +32,7 @@ venv/
 
 # Dockerfiles
 **/Dockerfile*
+!jupyter/pytorch[+]llmcompressor/ubi9-python-3.12/Dockerfile.cuda
 
 # Logs
 *.log

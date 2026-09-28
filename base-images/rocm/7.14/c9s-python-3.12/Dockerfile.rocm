@@ -1,0 +1,223 @@
+ARG TARGETARCH
+
+FROM quay.io/centos/centos:stream9@sha256:cfee9f59eb4d66295690829cebb75c6c97ca199c8929f8f933d88745280cbab4 AS buildscripts
+COPY base-images/utils/aipcc.sh /mnt/aipcc.sh
+COPY base-images/utils/fix-permissions /mnt/usr/bin/
+
+####################
+# base             #
+####################
+# ROCm packages, repos, env vars, and SDK are provided by the midstream image.
+# Source: https://github.com/opendatahub-io/base-containers (rocm/7.14/)
+FROM quay.io/opendatahub/odh-midstream-rocm-base-7-14:1.20260917.0@sha256:486cdaed011fa761368af6c1413a4895fcd4e72a39b6d187969515c7c6e2f5fb AS base
+
+USER 0
+ARG TARGETARCH
+ENV TARGETARCH=${TARGETARCH}
+ENV PYTHON=python3.12
+ENV VIRTUAL_ENV=/opt/app-root/
+
+# Duplicated in the AIPCC config block below; needed here so aipcc.sh
+# (which runs in this stage) can pip-install from the AIPCC index.
+ARG INDEX_URL
+ENV PIP_INDEX_URL=${INDEX_URL}
+ENV UV_INDEX_URL=${INDEX_URL}
+
+# OpenShift s2i / Cloud Native Buildpack user
+ENV CNB_USER_ID=1001 \
+    CNB_GROUP_ID=0
+
+# Custom fix-permissions script that extends sclorg version with chown to UID 1001
+COPY --from=buildscripts /mnt/usr/bin/ /usr/bin/
+
+RUN \
+--mount=from=buildscripts,source=/mnt,target=/mnt \
+--mount=type=cache,sharing=locked,id=dnf-c9s,target=/var/cache/dnf \
+/bin/bash <<'EOF'
+set -Eeuxo pipefail
+/mnt/aipcc.sh
+fix-permissions ${APP_ROOT} -P
+EOF
+
+# PQC (OCP 5.0): enable the post-quantum crypto policy profile (C9S carries
+# the RHEL 9.8 PQ profile; RHEL 10 enables PQ by default).
+RUN update-crypto-policies --set DEFAULT:PQ
+
+USER 1001
+WORKDIR /opt/app-root/bin
+
+# TensorFlow ROCm compatibility shim for EL9 userspace:
+# tensorflow-rocm 2.19.x can require GLIBCXX_3.4.30 / GLIBC_2.35 symbols that are
+# not provided by stock EL9 runtime libs. Build wrapper libs and prefer them.
+USER 0
+RUN /bin/bash <<'EOF'
+set -Eeuxo pipefail
+
+COMPAT_DIR=/usr/local/lib64/glibc-compat
+TMPDIR="$(mktemp -d)"
+trap 'rm -rf "${TMPDIR}"' EXIT
+mkdir -p "${COMPAT_DIR}"
+
+python -m pip install --no-cache-dir patchelf
+
+# --- libstdc++ wrapper (GLIBCXX_3.4.30: std::condition_variable::wait) ---
+cp /lib64/libstdc++.so.6.0.29 "${COMPAT_DIR}/libstdcxx_real.so.6"
+patchelf --set-soname libstdcxx_real.so.6 "${COMPAT_DIR}/libstdcxx_real.so.6"
+
+cat > "${TMPDIR}/stdcxx_compat.cc" << 'SRCEOF'
+#include <pthread.h>
+
+extern "C" void
+_ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE(
+    void *condvar, void *ulock)
+{
+    pthread_cond_wait(
+        static_cast<pthread_cond_t *>(condvar),
+        *static_cast<pthread_mutex_t **>(ulock));
+}
+SRCEOF
+
+cat > "${TMPDIR}/stdcxx_compat.map" << 'MAPEOF'
+GLIBCXX_3.4 {};
+GLIBCXX_3.4.1 {} GLIBCXX_3.4;
+GLIBCXX_3.4.2 {} GLIBCXX_3.4.1;
+GLIBCXX_3.4.3 {} GLIBCXX_3.4.2;
+GLIBCXX_3.4.4 {} GLIBCXX_3.4.3;
+GLIBCXX_3.4.5 {} GLIBCXX_3.4.4;
+GLIBCXX_3.4.6 {} GLIBCXX_3.4.5;
+GLIBCXX_3.4.7 {} GLIBCXX_3.4.6;
+GLIBCXX_3.4.8 {} GLIBCXX_3.4.7;
+GLIBCXX_3.4.9 {} GLIBCXX_3.4.8;
+GLIBCXX_3.4.10 {} GLIBCXX_3.4.9;
+GLIBCXX_3.4.11 {} GLIBCXX_3.4.10;
+GLIBCXX_3.4.12 {} GLIBCXX_3.4.11;
+GLIBCXX_3.4.13 {} GLIBCXX_3.4.12;
+GLIBCXX_3.4.14 {} GLIBCXX_3.4.13;
+GLIBCXX_3.4.15 {} GLIBCXX_3.4.14;
+GLIBCXX_3.4.16 {} GLIBCXX_3.4.15;
+GLIBCXX_3.4.17 {} GLIBCXX_3.4.16;
+GLIBCXX_3.4.18 {} GLIBCXX_3.4.17;
+GLIBCXX_3.4.19 {} GLIBCXX_3.4.18;
+GLIBCXX_3.4.20 {} GLIBCXX_3.4.19;
+GLIBCXX_3.4.21 {} GLIBCXX_3.4.20;
+GLIBCXX_3.4.22 {} GLIBCXX_3.4.21;
+GLIBCXX_3.4.23 {} GLIBCXX_3.4.22;
+GLIBCXX_3.4.24 {} GLIBCXX_3.4.23;
+GLIBCXX_3.4.25 {} GLIBCXX_3.4.24;
+GLIBCXX_3.4.26 {} GLIBCXX_3.4.25;
+GLIBCXX_3.4.27 {} GLIBCXX_3.4.26;
+GLIBCXX_3.4.28 {} GLIBCXX_3.4.27;
+GLIBCXX_3.4.29 {} GLIBCXX_3.4.28;
+GLIBCXX_3.4.30 {
+    global:
+        _ZNSt18condition_variable4waitERSt11unique_lockISt5mutexE;
+} GLIBCXX_3.4.29;
+CXXABI_1.3 {};
+CXXABI_1.3.1 {} CXXABI_1.3;
+CXXABI_1.3.2 {} CXXABI_1.3.1;
+CXXABI_1.3.3 {} CXXABI_1.3.2;
+CXXABI_1.3.4 {} CXXABI_1.3.3;
+CXXABI_1.3.5 {} CXXABI_1.3.4;
+CXXABI_1.3.6 {} CXXABI_1.3.5;
+CXXABI_1.3.7 {} CXXABI_1.3.6;
+CXXABI_1.3.8 {} CXXABI_1.3.7;
+CXXABI_1.3.9 {} CXXABI_1.3.8;
+CXXABI_1.3.10 {} CXXABI_1.3.9;
+CXXABI_1.3.11 {} CXXABI_1.3.10;
+CXXABI_1.3.12 {} CXXABI_1.3.11;
+CXXABI_1.3.13 {} CXXABI_1.3.12;
+CXXABI_TM_1 {};
+MAPEOF
+
+g++ -shared -fPIC \
+    -Wl,--version-script="${TMPDIR}/stdcxx_compat.map" \
+    -Wl,-soname,libstdc++.so.6 \
+    -Wl,-rpath,"${COMPAT_DIR}" \
+    -o "${COMPAT_DIR}/libstdc++.so.6" \
+    "${TMPDIR}/stdcxx_compat.cc" \
+    -lpthread "${COMPAT_DIR}/libstdcxx_real.so.6"
+
+# --- libm wrapper (GLIBC_2.35: hypot, hypotf) ---
+cp /lib64/libm.so.6 "${COMPAT_DIR}/libm_real.so.6"
+patchelf --set-soname libm_real.so.6 "${COMPAT_DIR}/libm_real.so.6"
+
+cat > "${TMPDIR}/libm_compat.c" << 'SRCEOF'
+#include <math.h>
+
+double __glibc_235_hypot(double x, double y) { return hypot(x, y); }
+float __glibc_235_hypotf(float x, float y) { return hypotf(x, y); }
+
+__asm__(".symver __glibc_235_hypot, hypot@GLIBC_2.35");
+__asm__(".symver __glibc_235_hypotf, hypotf@GLIBC_2.35");
+SRCEOF
+
+{
+    prev=""
+    while IFS= read -r ver; do
+        if [ -z "${prev}" ]; then
+            echo "${ver} {};"
+        else
+            echo "${ver} {} ${prev};"
+        fi
+        prev="${ver}"
+    done < <(readelf -V /lib64/libm.so.6 2>/dev/null \
+        | grep "Name: GLIBC_" \
+        | sed 's/.*Name: //' \
+        | sed 's/ .*//' \
+        | sort -t. -k1,1n -k2,2n -k3,3n -u)
+    echo "GLIBC_2.35 { global: hypot; hypotf; } ${prev};"
+} > "${TMPDIR}/libm_compat.map"
+
+gcc -shared -fPIC \
+    -Wl,--version-script="${TMPDIR}/libm_compat.map" \
+    -Wl,-soname,libm.so.6 \
+    -Wl,-rpath,"${COMPAT_DIR}" \
+    -o "${COMPAT_DIR}/libm.so.6" \
+    "${TMPDIR}/libm_compat.c" \
+    -lm "${COMPAT_DIR}/libm_real.so.6"
+
+python -m pip uninstall -y patchelf
+EOF
+
+USER 1001
+
+### BEGIN AIPCC pip and uv config files
+ARG INDEX_URL
+ENV PIP_INDEX_URL=${INDEX_URL}
+ENV UV_INDEX_URL=${INDEX_URL}
+COPY --chmod=664 --chown=1001:0 base-images/utils/pip.conf.in /opt/app-root/pip.conf
+COPY --chmod=664 --chown=1001:0 base-images/utils/uv.toml.in /opt/app-root/uv.toml
+RUN /bin/bash <<'EOF'
+set -Eeuxo pipefail
+if [ -z "${INDEX_URL}" ]; then
+  echo "ERROR: INDEX_URL build arg is required" >&2
+  exit 1
+fi
+sed -i "s|@INDEX_URL@|${INDEX_URL}|g" /opt/app-root/pip.conf
+sed -i "s|@INDEX_URL@|${INDEX_URL}|g" /opt/app-root/uv.toml
+EOF
+
+# Python and virtual env settings
+ENV VIRTUAL_ENV=${APP_ROOT} \
+    PIP_CONFIG_FILE=/opt/app-root/pip.conf \
+    UV_CONFIG_FILE=/opt/app-root/uv.toml \
+    PIP_NO_CACHE_DIR=off \
+    UV_NO_CACHE=true \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONIOENCODING=utf-8 \
+    LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    PS1="(app-root) \w\$ "
+### END AIPCC pip and uv config files
+
+# tensorflow-rocm on EL9: prefer ABI compatibility shims built above.
+ENV LD_LIBRARY_PATH=/usr/local/lib64/glibc-compat${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}
+
+# RHELAI-2417, RHELAI-1720: workaround for PyArrow
+# libjemalloc.so.2: cannot allocate memory in static TLS block
+ENV LD_PRELOAD=/usr/lib64/libjemalloc.so.2
+
+# Restore user workspace
+USER 1001
+WORKDIR /opt/app-root/src

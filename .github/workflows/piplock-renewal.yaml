@@ -1,12 +1,11 @@
 ---
-# This GitHub action is meant to update the lock files (pylock.toml)
-name: Lock Files Renewal Action
+# This GitHub action is meant to update the lock files (pylock.toml).
+# Scheduled runs moved to lock-renewal.yaml; this workflow remains for manual fallback.
+name: Lock Files Renewal Action (Pip)
+
+permissions: {}  # default-deny: unscoped jobs get only metadata:read
 
 on:  # yamllint disable-line rule:truthy
-  # Triggers the workflow every Wednesday at 1am UTC
-  schedule:
-    - cron: "0 1 * * 3"  # Weekly lockfile update
-    - cron: "0 9,15 * * 1-5"  # Auto-merge check at 9am and 3pm UTC on weekdays
   workflow_dispatch:  # for manual trigger workflow from GH Web UI
     inputs:
       operation:
@@ -42,14 +41,14 @@ on:  # yamllint disable-line rule:truthy
 jobs:
   refresh-lock-files:
     # Only run on Wednesday schedule or manual dispatch with 'update-lockfiles' operation
-    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.operation == 'update-lockfiles') || (github.event_name == 'schedule' && github.event.schedule == '0 1 * * 3')
-    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.operation == 'update-lockfiles'
+    runs-on: ubuntu-26.04
     concurrency:
       group: refresh-lock-files-${{ github.ref }}
       cancel-in-progress: false
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read  # checkout only; push and PR creation use the PAT
+      packages: read
     env:
       BRANCH: ${{ github.event.inputs.branch || 'main' }}
       INDEX_MODE: ${{ github.event.inputs.index_mode || 'auto' }}
@@ -58,30 +57,68 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ env.BRANCH }}
-          token: ${{ secrets.GH_ACCESS_TOKEN }}
-          persist-credentials: true
+          persist-credentials: false
+          fetch-depth: 0  # update_imagestream_annotations_from_pylock.py uses git show for tag SHAs
 
       - name: Configure Git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "GitHub Actions"
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.12'
+      - name: Setup uv and Python
+        uses: ./.github/actions/setup-uv
 
-      - name: Install uv
-        run: pip install "uv==0.9.27"
+      - name: Install skopeo
+        uses: ./.github/actions/apt-install
+        with:
+          packages: skopeo
+
+      - name: Login to quay.io/aipcc (if the secret is present)
+        shell: bash
+        env:
+          AIPCC_USER: ${{ secrets.AIPCC_QUAY_BOT_USERNAME }}
+          AIPCC_PASS: ${{ secrets.AIPCC_QUAY_BOT_PASSWORD }}
+        run: |
+          if [[ -z "${AIPCC_USER}" ]]; then
+            echo "AIPCC_QUAY_BOT_USERNAME is not set, skipping quay.io/aipcc login"
+            exit 0
+          fi
+          printf '%s' "${AIPCC_PASS}" | skopeo login --username "${AIPCC_USER}" --password-stdin quay.io
 
       - name: Run make refresh-lock-files
         run: |
-          make refresh-lock-files INDEX_MODE=${{ env.INDEX_MODE }}
+          make refresh-lock-files INDEX_MODE="$INDEX_MODE"
         env:
           FORCE_LOCKFILES_UPGRADE: ${{ env.FORCE_LOCKFILES_UPGRADE }}
+
+      # Regenerate Dockerfiles after lockfile changes.
+      # Lockfiles may bump package versions (e.g. uv) that dockerfile_fragments.py
+      # derives and embeds in Dockerfiles. Without this step, Dockerfiles drift
+      # out of sync and check-generated-code fails.
+      # See: commit 41aed2702 (lockfile-derived versions), PR #3239 (broke main).
+      - name: Regenerate Dockerfiles from updated lockfiles
+        run: |
+          uv run scripts/dockerfile_fragments.py
+          uv run manifests/tools/generate_kustomization.py
+
+      - name: Refresh ImageStream notebook dependency annotations from pylocks
+        run: |
+          uv run python manifests/tools/update_imagestream_annotations_from_pylock.py --variant odh
+          uv run python manifests/tools/update_imagestream_annotations_from_pylock.py --variant rhoai
+
+      - name: Login to GitHub Container Registry
+        if: ${{ github.repository != 'opendatahub-io/notebooks' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate manifests (make test)
+        run: make test
 
       - name: Create Pull Request
         env:
@@ -93,15 +130,23 @@ jobs:
             exit 0
           fi
 
+          # Skip PR creation if only timestamp changes
+          if git diff --cached -I '^#.*--exclude-newer' --quiet; then
+            echo "Only timestamp changes. Skipping PR creation."
+            exit 0
+          fi
+
           BRANCH_NAME="lockfile-update-$(date +%Y%m%d-%H%M)"
           git checkout -b "$BRANCH_NAME"
-          git commit -m "Update lock files"
-          git push -u origin "$BRANCH_NAME"
+          git commit -m "Update lock files and ImageStream dependency annotations"
+          # https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-as-a-github-app-installation#using-an-installation-access-token-to-authenticate-as-an-app-installation
+          git push -u "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" "$BRANCH_NAME"
 
           gh pr create \
-            --title "Update lock files" \
+            --title "Update lock files and ImageStream dependency annotations" \
+            --head "$BRANCH_NAME" \
             --body "$(cat <<'EOF'
-          Automated lock file update.
+          Automated lock file update, Dockerfile/kustomization regeneration, and ImageStream `notebook-python-dependencies` / `notebook-software` annotations from pylocks.
 
           **Auto-merge policy:** This PR will be automatically merged after 1 working day unless:
           - Moved to draft status
@@ -110,15 +155,14 @@ jobs:
           EOF
           )" \
             --label "automated-lockfile-update" \
-            --base "${{ env.BRANCH }}"
+            --base "$BRANCH"
 
   auto-merge-lockfile-prs:
     # Run on auto-merge schedule or manual dispatch with 'auto-merge' operation
-    if: (github.event_name == 'workflow_dispatch' && github.event.inputs.operation == 'auto-merge') || (github.event_name == 'schedule' && github.event.schedule == '0 9,15 * * 1-5')
-    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.operation == 'auto-merge'
+    runs-on: ubuntu-26.04
     permissions:
-      contents: write
-      pull-requests: write
+      pull-requests: write  # github.token is only used for PR approval (line 225)
     steps:
       - name: Auto-merge eligible lockfile PRs
         env:

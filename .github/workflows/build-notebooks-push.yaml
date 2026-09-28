@@ -21,14 +21,13 @@
   "schedule":
     - "cron": "0 2 * * *"
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   gen:
     name: Generate job matrix
-    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    runs-on: ubuntu-26.04
     # for odh-io/notebooks and rhds/notebooks, allow only main, rhoai-*, release-*
     if: ${{ github.event_name == 'workflow_dispatch' ||
       (github.repository != 'opendatahub-io/notebooks' && github.repository != 'red-hat-data-services/notebooks')
@@ -36,14 +35,19 @@ jobs:
       || startsWith(github.ref_name, 'rhoai-') || startsWith(github.ref_name, 'release-') }}
     outputs:
       matrix: ${{ steps.gen.outputs.matrix }}
+      matrix_rhoai: ${{ steps.gen.outputs.matrix_rhoai }}
       has_jobs: ${{ steps.gen.outputs.has_jobs }}
+      has_rhoai_jobs: ${{ steps.gen.outputs.has_rhoai_jobs }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
-      - uses: actions/setup-go@v6
+      - name: Login to GitHub Container Registry
+        if: ${{ github.repository != 'opendatahub-io/notebooks' }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f  # v4.6.0
         with:
-          go-version: "stable"
-          cache-dependency-path: "**/*.sum"
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Determine targets to build (we want to build everything on push)
         run: |
@@ -56,6 +60,10 @@ jobs:
         shell: bash
 
   build:
+    permissions:
+      contents: read
+      packages: write
+    name: "${{ matrix.target }} · ${{ matrix.platform }}"
     needs: ["gen"]
     strategy:
       fail-fast: false
@@ -71,12 +79,16 @@ jobs:
     secrets: inherit
 
   build-aipcc:
+    permissions:
+      contents: read
+      packages: write
+    name: "${{ matrix.target }} · ${{ matrix.platform }}"
     needs: ["gen"]
     strategy:
       fail-fast: false
-      matrix: "${{ fromJson(needs.gen.outputs.matrix) }}"
+      matrix: "${{ fromJson(needs.gen.outputs.matrix_rhoai) }}"
     uses: ./.github/workflows/build-notebooks-TEMPLATE.yaml
-    if: ${{ (inputs.rhds || (github.event_name != 'workflow_dispatch' && github.repository == 'red-hat-data-services/notebooks')) && fromJson(needs.gen.outputs.has_jobs) }}
+    if: ${{ (inputs.rhds || (github.event_name != 'workflow_dispatch' && github.repository == 'red-hat-data-services/notebooks')) && fromJson(needs.gen.outputs.has_rhoai_jobs) }}
     with:
       target: "${{ matrix.target }}"
       python: "${{ matrix.python }}"
@@ -84,5 +96,5 @@ jobs:
       platform: "${{ matrix.platform }}"
       # rhds/notebooks builds from AIPCC base images that are RHEL-based
       subscription: ${{ true }}
-      konflux: ${{ true }}
+      product: rhoai
     secrets: inherit

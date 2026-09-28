@@ -1,0 +1,112 @@
+---
+name: jira-conventions
+description: Jira project IDs, custom fields, and conventions for creating and updating issues in RHAIENG and related projects (RHOAIENG CVE trackers, RHAIRFE, RHAISTRAT) on redhat.atlassian.net — cloud ID, component/team IDs, key custom field IDs, issue hierarchy and parent linking, MCP create/update/transition call patterns, link types, sprint assignment, and the RHOAIENG CVE resolution workflow. Use whenever creating, updating, linking, assigning, or transitioning Jira tickets for this team; do not use for non-Jira task tracking.
+---
+
+# Jira Conventions for Notebooks Team
+
+## Atlassian Cloud Instance
+
+- **Site**: `redhat.atlassian.net`
+- **Cloud ID (UUID)**: `2b9e35e3-6bd3-4cec-b838-f4249ee02432`
+- Either value works as `cloudId` in MCP calls (the schema accepts "UUID or site URL"). Use the UUID directly to avoid the agent making a preliminary `getAccessibleAtlassianResources` call to discover it.
+
+## Projects
+
+- **RHAIENG** -- engineering work (Epics, Stories, Tasks, Bugs)
+- **RHOAIENG** -- per-component CVE vulnerability trackers (auto-generated from RHAIENG CVE bugs)
+- **RHAIRFE** -- inbound feature requests (Feature Request type)
+- **RHAISTRAT** -- strategy-level Initiatives and Features
+
+## Component and Team
+
+- **Component**: `Notebooks` (id: `49589`)
+- **Team** (custom field `customfield_10001`): pass as a plain string ID `ec74d716-af36-4b3c-950f-f79213d08f71-62` (displays as "Notebooks" / "AAIET Notebooks")
+
+## Key Custom Fields (RHAIENG)
+
+| Field | Field ID | Notes |
+|-------|----------|-------|
+| Team | `customfield_10001` | Atlassian team type; pass the team UUID string directly |
+| Epic Link | `customfield_10014` | Legacy field; prefer `parent` for linking Stories to Epics |
+| Epic Name | `customfield_10011` | Auto-populated from summary |
+
+## Issue Hierarchy (RHAIENG)
+
+- **Outcome** (level 3)
+- **Initiative / Feature / Feature Request** (level 2)
+- **Epic** (level 1) -- use `parent` field to link to a level-2 issue (works cross-project)
+- **Story / Task / Bug / Spike** (level 0) -- use `parent` field to link to an Epic
+
+## Creating Issues via MCP
+
+- Use `createJiraIssue` with `cloudId: "redhat.atlassian.net"`
+- Components go in `additional_fields`: `{"components": [{"name": "Notebooks"}]}`
+- Team goes in `additional_fields`: `{"customfield_10001": "ec74d716-af36-4b3c-950f-f79213d08f71-62"}`
+- Use `contentFormat: "markdown"` for description
+- Cross-project parent links work (e.g., RHAIENG Epic parented to RHAIRFE Feature Request)
+
+## Link Types (commonly used)
+
+- `Related` (id: 10077) -- general association
+- `Blocks` (id: 10000) -- dependency
+- `Depend` (id: 10076) -- dependency (alternative)
+
+## RHOAIENG Project (per-component CVE trackers)
+
+RHOAIENG tickets are per-component vulnerability trackers created automatically from RHAIENG parent CVE bugs. They use a different Jira project configuration with different field IDs on different screens.
+
+### Key Differences from RHAIENG
+
+| Aspect | RHAIENG | RHOAIENG |
+|--------|---------|----------|
+| Sprint field | `customfield_12310940` | `customfield_10020` (standard Jira Cloud sprint) |
+| Sprint screen | Main issue fields | Different tab / screen |
+| Issue types | Bug, Story, Task, Epic | Vulnerability |
+
+### Sprint Assignment
+
+The sprint field ID differs between projects. Use `jira_add_issues_to_sprint` (from the project MCP server) which works for **both** projects regardless of field ID:
+
+```text
+jira_add_issues_to_sprint(sprint_id="66724", issue_keys="RHOAIENG-12345,RHOAIENG-12346")
+```
+
+Do **not** try to set `customfield_12310940` on RHOAIENG tickets — it will fail with "Field is not on the appropriate screen, or unknown."
+
+### CVE Resolution Workflow
+
+Standard workflow for resolving CVE tickets on `rhoai-2.25`:
+
+1. **Verify fix**: Check `dependencies/cve-constraints.txt` for the package constraint, then confirm all `pylock.toml` files on the branch have the required version.
+2. **Post evidence** on parent RHAIENG + all RHOAIENG children (evidence first, always).
+3. **Assign** unassigned tickets (skip tickets already assigned to someone else).
+4. **Set sprint** via `jira_add_issues_to_sprint` (works for both RHAIENG and RHOAIENG).
+5. **Transition to Resolved** using transition ID `131`.
+
+### Updating RHOAIENG Issues via MCP
+
+Use `jira_update_issue` with the `fields` parameter as a JSON string:
+
+```text
+jira_update_issue(issue_key="RHOAIENG-12345", fields="{\"assignee\": \"user@redhat.com\"}")
+```
+
+For transitions:
+
+```text
+jira_transition_issue(issue_key="RHOAIENG-12345", transition_id="131")
+```
+
+### Current Sprint
+
+- **Sprint name**: "Notebooks - Narwal"
+- **Sprint ID**: `66724`
+
+## Recently Created Issues (reference)
+
+- Epic [RHAIENG-4244](https://redhat.atlassian.net/browse/RHAIENG-4244) -- ARM workbench support, parented to RHAIRFE-1439
+  - [RHAIENG-4245](https://redhat.atlassian.net/browse/RHAIENG-4245) -- Konflux multi-arch config
+  - [RHAIENG-4246](https://redhat.atlassian.net/browse/RHAIENG-4246) -- Review Gerard's ARM spike
+  - [RHAIENG-4247](https://redhat.atlassian.net/browse/RHAIENG-4247) -- Initial ARM testing
+  - [RHAIENG-4248](https://redhat.atlassian.net/browse/RHAIENG-4248) -- Ongoing ARM regression testing

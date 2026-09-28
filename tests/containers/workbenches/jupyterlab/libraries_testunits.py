@@ -6,9 +6,11 @@ import unittest
 # Suppress noisy logs from libraries, especially during testing
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["KMP_WARNINGS"] = "0"
+# Prefer UPB for feast/protobuf paths (AIPCC-13675); protobuf_testunits.py asserts it.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "upb")
 
 
-# ruff: noqa: PLC0415 `import` should be at the top-level of a file
+# ruff: file-ignore[import-outside-top-level] `import` should be at the top-level of a file
 class TestDataScienceLibs(unittest.TestCase):
     """A test suite to verify the basic functionality of key data science libraries."""
 
@@ -105,19 +107,47 @@ class TestDataScienceLibs(unittest.TestCase):
         print("✅ Torchvision test passed.")
 
     def test_torchaudio(self):
-        """🧪 Tests torchaudio waveform generation."""
+        """Tests torchaudio waveform generation."""
         if "-pytorch-" not in self.image:
             self.skipTest("Not a Torch image")
         try:
-            import torchaudio  # pyright: ignore[reportMissingImports]
+            import torchaudio  # pyright: ignore[reportMissingImports]  # ruff: ignore[unused-import]
         except ImportError:
-            # TODO: determine if having torchaudio installed is a requirement
             self.skipTest("Torchaudio is not installed.")
 
+        import math
+
+        import torch  # pyright: ignore[reportMissingImports]
+
         sample_rate = 16000
-        waveform = torchaudio.functional.generate_sine(440, sample_rate=sample_rate, duration=0.5)
+        duration = 0.5
+        freq = 440
+        # TODO(RHAIENG-5848): generate_sine was removed in torchaudio 2.9; replace with proper torchaudio API
+        t = torch.linspace(0, duration, int(sample_rate * duration))
+        waveform = torch.sin(2 * math.pi * freq * t).unsqueeze(0)
         self.assertEqual(waveform.shape, (1, 8000), "Torchaudio waveform shape is incorrect.")
-        print("✅ Torchaudio test passed.")
+        print("Torchaudio test passed.")
+
+    def test_feast(self):
+        """Tests that the feast module imports and the CLI entry point works."""
+        import subprocess
+
+        import feast  # pyright: ignore[reportMissingImports]
+
+        self.assertIsNotNone(feast.__version__, "Feast version is not set.")
+
+        result = subprocess.run(["feast", "version"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, f"'feast version' failed: {result.stderr}")
+        print(f"✅ Feast test passed (version: {feast.__version__}).")
+
+    def test_mlflow(self):
+        """Tests MLflow module import and basic functionality."""
+        import mlflow  # pyright: ignore[reportMissingImports]
+
+        self.assertIsNotNone(mlflow.__version__, "MLflow version is not set.")
+        self.assertTrue(hasattr(mlflow, "start_run"), "MLflow does not have start_run function.")
+        self.assertTrue(hasattr(mlflow, "log_param"), "MLflow does not have log_param function.")
+        print(f"✅ MLflow test passed (version: {mlflow.__version__}).")
 
 
 if __name__ == "__main__":

@@ -22,10 +22,22 @@ Use https://pypi.org/project/py-make/ or https://github.com/JetBrains/intellij-p
 project_dir = pathlib.Path(__file__).parent.parent.parent.absolute()
 
 ARM64_COMPATIBLE = {
+    "codeserver-baseline-ubi9-python-3.12",
     "codeserver-ubi9-python-3.12",
     "cuda-jupyter-minimal-ubi9-python-3.12",
+    "cuda-jupyter-pytorch-llmcompressor-ubi9-python-3.12",
+    "cuda-jupyter-pytorch-ubi9-python-3.12",
     "cuda-jupyter-tensorflow-ubi9-python-3.12",
+    "jupyter-baseline-ubi9-python-3.12",
+    "jupyter-datascience-ubi9-python-3.12",
+    "jupyter-minimal-ubi9-python-3.12",
+    "jupyter-trustyai-ubi9-python-3.12",
+    "runtime-baseline-ubi9-python-3.12",
+    "runtime-cuda-pytorch-llmcompressor-ubi9-python-3.12",
+    "runtime-cuda-pytorch-ubi9-python-3.12",
     "runtime-cuda-tensorflow-ubi9-python-3.12",
+    "runtime-datascience-ubi9-python-3.12",
+    "runtime-minimal-ubi9-python-3.12",
 }
 
 PPC64LE_COMPATIBLE = {
@@ -39,6 +51,24 @@ S390X_COMPATIBLE = {
     "runtime-datascience-ubi9-python-3.12",
     # add more here
 }
+
+
+def target_needs_subscription(target: str) -> bool:
+    return "rhel" in target
+
+
+# Baseline workbench/runtime images are ODH-only (no konflux.cpu.conf / RHDS prefetch).
+ODH_ONLY_BASELINE_TARGETS = frozenset(
+    {
+        "jupyter-baseline-ubi9-python-3.12",
+        "codeserver-baseline-ubi9-python-3.12",
+        "runtime-baseline-ubi9-python-3.12",
+    }
+)
+
+
+def target_supports_rhoai_build(target: str) -> bool:
+    return target not in ODH_ONLY_BASELINE_TARGETS
 
 
 def extract_image_targets(
@@ -55,7 +85,16 @@ def extract_image_targets(
 
     # Extract the 'all-images' entry and its values
     all_images = []
-    match = re.search(rf"^{makefile_all_target}:\s+(.*)$", output, re.MULTILINE)
+    match = re.search(
+        rf"""
+        ^{makefile_all_target}:  # target name
+        \s+                      # colon and whitespace separator
+        ( [^#]* )                # prerequisites (stop before any inline comment)
+        $                        # end of line
+        """,
+        output,
+        re.MULTILINE | re.VERBOSE,
+    )
     if match:
         all_images = match.group(1).split()
 
@@ -86,6 +125,73 @@ class S390xImages(enum.Enum):
     EXCLUDE = "exclude"
     INCLUDE = "include"
     ONLY = "only"
+
+
+def filter_rhel_targets(targets: list[str], mode: RhelImages) -> list[str]:
+    if mode == RhelImages.INCLUDE:
+        return targets
+    if mode == RhelImages.EXCLUDE:
+        return [target for target in targets if not target_needs_subscription(target)]
+    if mode == RhelImages.INCLUDE_ONLY:
+        return [target for target in targets if target_needs_subscription(target)]
+    raise Exception(f"Unknown value for --rhel-images: {mode}")
+
+
+def assign_platforms(
+    targets: list[str],
+    *,
+    arm64_images: Arm64Images,
+    ppc64le_images: Ppc64leImages,
+    s390x_images: S390xImages,
+) -> list[tuple[str, str]]:
+    targets_with_platform: list[tuple[str, str]] = []
+    for target in targets:
+        if s390x_images != S390xImages.ONLY or arm64_images != Arm64Images.ONLY:
+            targets_with_platform.append((target, "linux/amd64"))
+        if arm64_images != Arm64Images.EXCLUDE and s390x_images != S390xImages.ONLY:
+            if target in ARM64_COMPATIBLE:
+                targets_with_platform.append((target, "linux/arm64"))
+        if ppc64le_images != Ppc64leImages.EXCLUDE:
+            if target in PPC64LE_COMPATIBLE:
+                targets_with_platform.append((target, "linux/ppc64le"))
+        if s390x_images != S390xImages.EXCLUDE and arm64_images != Arm64Images.ONLY:
+            # NOTE: hardcode the list of s390x-compatible Makefile targets in S390X_COMPATIBLE
+            if target in S390X_COMPATIBLE:
+                targets_with_platform.append((target, "linux/s390x"))
+    return targets_with_platform
+
+
+def matrix_entries(entries: list[tuple[str, str]]) -> list[dict[str, str | bool]]:
+    return [
+        {
+            "target": target,
+            "python": "3.12",
+            "platform": platform,
+            "subscription": target_needs_subscription(target),
+        }
+        for (target, platform) in entries
+    ]
+
+
+def build_matrix_output(targets_with_platform: list[tuple[str, str]]) -> list[str]:
+    # https://stackoverflow.com/questions/66025220/paired-values-in-github-actions-matrix
+    rhoai_targets_with_platform = [
+        (target, platform) for (target, platform) in targets_with_platform if target_supports_rhoai_build(target)
+    ]
+    return [
+        "matrix="
+        + json.dumps(
+            {"include": matrix_entries(targets_with_platform)},
+            separators=(",", ":"),
+        ),
+        "matrix_rhoai="
+        + json.dumps(
+            {"include": matrix_entries(rhoai_targets_with_platform)},
+            separators=(",", ":"),
+        ),
+        "has_jobs=" + json.dumps(len(targets_with_platform) > 0, separators=(",", ":")),
+        "has_rhoai_jobs=" + json.dumps(len(rhoai_targets_with_platform) > 0, separators=(",", ":")),
+    ]
 
 
 def main() -> None:
@@ -143,49 +249,16 @@ def main() -> None:
         changed_files = gha_pr_changed_files.list_changed_files(args.from_ref, args.to_ref)
         targets = gha_pr_changed_files.filter_out_unchanged(targets, changed_files)
 
-    if args.rhel_images == RhelImages.INCLUDE:
-        pass
-    elif args.rhel_images == RhelImages.EXCLUDE:
-        targets = [target for target in targets if "rhel" not in target]
-    elif args.rhel_images == RhelImages.INCLUDE_ONLY:
-        targets = [target for target in targets if "rhel" in target]
-    else:
-        raise Exception(f"Unknown value for --rhel-images: {args.rhel_images}")
+    targets = filter_rhel_targets(targets, args.rhel_images)
 
-    targets_with_platform: list[tuple[str, str]] = []
-    for target in targets:
-        if args.s390x_images != S390xImages.ONLY or args.arm64_images != Arm64Images.ONLY:
-            targets_with_platform.append((target, "linux/amd64"))
-        if args.arm64_images != Arm64Images.EXCLUDE and args.s390x_images != S390xImages.ONLY:
-            if target in ARM64_COMPATIBLE:
-                targets_with_platform.append((target, "linux/arm64"))
-        if args.ppc64le_images != Ppc64leImages.EXCLUDE:
-            if target in PPC64LE_COMPATIBLE:
-                targets_with_platform.append((target, "linux/ppc64le"))
-        if args.s390x_images != S390xImages.EXCLUDE and args.arm64_images != Arm64Images.ONLY:
-            # NOTE: hardcode the list of s390x-compatible Makefile targets in S390X_COMPATIBLE
-            if target in S390X_COMPATIBLE:
-                targets_with_platform.append((target, "linux/s390x"))
+    targets_with_platform = assign_platforms(
+        targets,
+        arm64_images=args.arm64_images,
+        ppc64le_images=args.ppc64le_images,
+        s390x_images=args.s390x_images,
+    )
 
-    # https://stackoverflow.com/questions/66025220/paired-values-in-github-actions-matrix
-    output = [
-        "matrix="
-        + json.dumps(
-            {
-                "include": [
-                    {
-                        "target": target,
-                        "python": "3.12",
-                        "platform": platform,
-                        "subscription": "rhel" in target,
-                    }
-                    for (target, platform) in targets_with_platform
-                ],
-            },
-            separators=(",", ":"),
-        ),
-        "has_jobs=" + json.dumps(len(targets_with_platform) > 0, separators=(",", ":")),
-    ]
+    output = build_matrix_output(targets_with_platform)
 
     print("targets", targets_with_platform)
     print(*output, sep="\n")
@@ -202,11 +275,53 @@ if __name__ == "__main__":
     main()
 
 
-class SelfTests(unittest.TestCase):
+class TestSelf(unittest.TestCase):
+    def test_target_needs_subscription(self):
+        assert target_needs_subscription("jupyter-baseline-ubi9-python-3.12") is False
+        assert target_needs_subscription("codeserver-baseline-ubi9-python-3.12") is False
+        assert target_needs_subscription("runtime-baseline-ubi9-python-3.12") is False
+        assert target_needs_subscription("cuda-jupyter-minimal-ubi9-python-3.12") is False
+        assert target_needs_subscription("runtime-rhel-cuda-tensorflow-ubi9-python-3.12") is True
+
+    def test_target_supports_rhoai_build(self):
+        assert target_supports_rhoai_build("jupyter-baseline-ubi9-python-3.12") is False
+        assert target_supports_rhoai_build("codeserver-baseline-ubi9-python-3.12") is False
+        assert target_supports_rhoai_build("runtime-baseline-ubi9-python-3.12") is False
+        assert target_supports_rhoai_build("jupyter-minimal-ubi9-python-3.12") is True
+
+    def test_filter_rhel_targets_excludes_rhel_marked_targets(self):
+        targets = [
+            "jupyter-baseline-ubi9-python-3.12",
+            "codeserver-baseline-ubi9-python-3.12",
+            "runtime-baseline-ubi9-python-3.12",
+            "jupyter-minimal-ubi9-python-3.12",
+            "runtime-rhel-cuda-tensorflow-ubi9-python-3.12",
+        ]
+
+        assert filter_rhel_targets(targets, RhelImages.EXCLUDE) == [
+            "jupyter-baseline-ubi9-python-3.12",
+            "codeserver-baseline-ubi9-python-3.12",
+            "runtime-baseline-ubi9-python-3.12",
+            "jupyter-minimal-ubi9-python-3.12",
+        ]
+
+    def test_filter_rhel_targets_include_only_keeps_rhel_marked_targets(self):
+        targets = [
+            "jupyter-baseline-ubi9-python-3.12",
+            "codeserver-baseline-ubi9-python-3.12",
+            "runtime-baseline-ubi9-python-3.12",
+            "jupyter-minimal-ubi9-python-3.12",
+            "runtime-rhel-cuda-tensorflow-ubi9-python-3.12",
+        ]
+
+        assert filter_rhel_targets(targets, RhelImages.INCLUDE_ONLY) == [
+            "runtime-rhel-cuda-tensorflow-ubi9-python-3.12",
+        ]
+
     def test_select_changed_targets_dockerfile(self):
         targets = extract_image_targets(makefile_dir=project_dir)
 
-        changed_files = ["jupyter/datascience/ubi9-python-3.12/Dockerfile.cpu"]
+        changed_files = ["jupyter/datascience/ubi9-python-3.12/Dockerfile.konflux.cpu"]
 
         targets = gha_pr_changed_files.filter_out_unchanged(targets, changed_files)
         assert set(targets) == {"jupyter-datascience-ubi9-python-3.12"}
@@ -222,6 +337,7 @@ class SelfTests(unittest.TestCase):
             "cuda-jupyter-pytorch-llmcompressor-ubi9-python-3.12",
             "cuda-jupyter-pytorch-ubi9-python-3.12",
             "cuda-jupyter-tensorflow-ubi9-python-3.12",
+            "jupyter-baseline-ubi9-python-3.12",
             "jupyter-datascience-ubi9-python-3.12",
             "jupyter-minimal-ubi9-python-3.12",
             "jupyter-trustyai-ubi9-python-3.12",

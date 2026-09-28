@@ -4,42 +4,53 @@ version = "0.1.0"
 requires-python = "==3.12.*"
 
 dependencies = [
+    "uv",
+    "micropipenv[toml]",
 
     # ROCm TensorFlow packages
-    # https://rocm.docs.amd.com/projects/install-on-linux/en/latest/install/3rd-party/tensorflow-install.html#using-a-wheels-package
-    # TODO(jdanek): consider adding #sha256=814a5e4842b0c92d63c7a0bb4df0baf51ff2db8615535d83fe8958204b840598
-    "tensorflow-rocm @ https://repo.radeon.com/rocm/manylinux/rocm-rel-6.4/tensorflow_rocm-2.18.1-cp312-cp312-manylinux_2_28_x86_64.whl",
-    # tensorflow-rocm==2.x needs tensorboard>=2.x,<2.x+1
-    "tensorboard~=2.18.0",
+    "tensorflow-rocm",
+    "tensorboard",
 
     # Datascience and useful extensions
-    "codeflare-sdk~=0.35.0",
     "odh-notebooks-meta-runtime-datascience-deps",
 
-    # DB connectors
-    "pymongo~=4.16.0",
-    "psycopg~=3.3.2",
-    "pyodbc~=5.3.0",
-    "mysql-connector-python~=9.5.0",
-
+    "odh-notebooks-meta-db-connectors-deps",
     "odh-notebooks-meta-runtime-elyra-deps",
+    "odh-notebooks-meta-runtime-kale-deps",
 
     # Base packages
-    "setuptools==80.9.0",
-    "wheel==0.46.3",
+    "setuptools",
+    "wheel",
 ]
 
 [tool.uv]
+# RHAIENG-5451 / RHAIENG-7088: fail at lock-generation time (not inside the
+# Konflux build) if a package version lacks wheels for any architecture this
+# image ships. See opendatahub-io/notebooks#4422 for the dynamic alternative.
+required-environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
+# FIPS: exclude statically linked py-spy profiler (RHAIENG-58916)
+exclude-dependencies = ["py-spy"]
+
+override-dependencies = [
+    # tensorflow-rocm 2.20+redhat allows protobuf>=5.28.0 (no upper bound).
+    # AIPCC-13675: UPB segfault on s390x affects 6.33.5-6.33.6; fixed in 7.x.
+    # kfp 2.17.0's protobuf<7.0 is a conservative pin (gencode 6.31.1; APIs exist in 7.x).
+    # 7.x series only.
+    "protobuf>=7.36.1,<8",
+]
 
 constraint-dependencies = [
-    # AttributeError: module 'ml_dtypes' has no attribute 'float4_e2m1fn'
-    "onnx<1.19.0",
+
 ]
 
 environments = [
-    "sys_platform == 'linux' and implementation_name == 'cpython'",
+    "sys_platform == 'linux' and implementation_name == 'cpython' and python_full_version == '3.12.*'",
 ]
 
 [tool.uv.sources]
 odh-notebooks-meta-runtime-elyra-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-elyra-deps" }
 odh-notebooks-meta-runtime-datascience-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-datascience-deps" }
+odh-notebooks-meta-runtime-kale-deps = { path = "../../../dependencies/odh-notebooks-meta-runtime-kale-deps" }
+odh-notebooks-meta-db-connectors-deps = { path = "../../../dependencies/odh-notebooks-meta-db-connectors-deps" }

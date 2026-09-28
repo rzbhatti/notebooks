@@ -1,14 +1,17 @@
-import {Page} from "@playwright/test";
+import {expect, Page, TestInfo} from "@playwright/test";
 
 export async function waitForStableDOM(page: Page, pageRootSelector: string, checkPeriod: number, timeout: number): Promise<void> {
     // https://github.com/cypress-io/cypress/issues/5275#issuecomment-1003669708
     const parameters: [string, number, number] = [pageRootSelector, checkPeriod, timeout]
     await page.evaluate( ([pageRootSelector, checkPeriod, timeout]) => {
         const targetNode = document.querySelector(pageRootSelector);
+        if (!targetNode) {
+            throw new Error(`Selector "${pageRootSelector}" did not match any element`);
+        }
         const config = { attributes: true, childList: true, subtree: true };
 
-        var started = performance.now();
-        var mutated = started;
+        const started = performance.now();
+        let mutated = started;
 
         const callback: MutationCallback = (mutationList, _observer) => {
             for (const mutation of mutationList) {
@@ -26,17 +29,19 @@ export async function waitForStableDOM(page: Page, pageRootSelector: string, che
         observer.observe(targetNode, config);
 
         return new Promise<void>((resolve, reject) => {
-            let loop = () => {
-                let now = performance.now();
+            const loop = () => {
+                const now = performance.now();
                 if (now - mutated > checkPeriod) {
                     observer.disconnect();
                     resolve();
+                    return;
                 }
                 if (now - started > timeout) {
                     observer.disconnect();
-                    reject();
+                    reject(new Error(`DOM not stable after ${timeout}ms`));
+                    return;
                 }
-                window.setInterval(loop, checkPeriod);
+                window.setTimeout(loop, checkPeriod);
             };
             loop()
         })
@@ -60,24 +65,52 @@ export async function waitForNextRender(page: Page) {
      */
     // wait for next frame being rendered
     await page.evaluate( () => {
-        return new window.Promise((callback: Function) => {
-            window.requestAnimationFrame(() => window.setTimeout(callback));
+        return new window.Promise<void>((resolve) => {
+            window.requestAnimationFrame(() => window.setTimeout(resolve));
         });
     });
 }
 
 // https://github.com/microsoft/playwright/issues/14854#issuecomment-1155347129
-export async function screenshotOnFailure({ page }, testInfo) {
+export async function screenshotOnFailure({ page }: { page: Page }, testInfo: TestInfo) {
     if (testInfo.status !== testInfo.expectedStatus) {
         await takeScreenshot(page, testInfo, `failure.png`)
     }
 }
 
-export async function takeScreenshot( page , testInfo, filename) {
+export async function takeScreenshot(page: Page, testInfo: TestInfo, filename: string) {
     // Get a unique place for the screenshot.
     const screenshotPath = testInfo.outputPath(filename);
     // Add it to the report.
     testInfo.attachments.push({name: 'screenshot', path: screenshotPath, contentType: 'image/png'});
     // Take the screenshot itself.
     await page.screenshot({path: screenshotPath, timeout: 5000});
+}
+
+/**
+ * Assert the codeserver startup surface:
+ * - STRIP_COPILOT_PROPRIETARY=true: workspace README tab
+ * - default (false) or older pinned images: built-in Welcome page
+ */
+export async function assertStartupSurface(page: Page, testInfo: TestInfo): Promise<void> {
+    const readmeTab = page.getByRole('tab', { name: /README\.md/i })
+    const readmeVisible = await readmeTab.waitFor({state: 'visible', timeout: 5000})
+        .then(() => true)
+        .catch(() => false)
+
+    if (readmeVisible) {
+        await expect(readmeTab).toBeVisible()
+        const workbench = page.locator("div.monaco-workbench")
+        // README preview content lives in a webview/iframe; tab + editor surface is enough.
+        await expect(workbench.locator(".editor-container, .editor-instance").first()).toBeVisible({timeout: 15000})
+        await waitForNextRender(page)
+        await takeScreenshot(page, testInfo, "workspace-readme.png")
+        return
+    }
+
+    await expect(page.getByRole('tab', { name: /Welcome/i })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'code-server', level: 1 })).toBeVisible()
+    await expect(page.getByText('Editing evolved')).toBeVisible()
+    await waitForNextRender(page)
+    await takeScreenshot(page, testInfo, "welcome.png")
 }

@@ -1,0 +1,289 @@
+# Testing Guide
+
+This document is the test catalog for the notebooks repository. It describes what
+tests exist, where they live, how to run them, and how they map to CI.
+
+For operational gotchas (worktree naming, pyfakefs, PRODUCT matching, CI `-n` metadata),
+see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
+## Setup
+
+```bash
+uv venv --python "$(which python3.14)"
+uv sync --locked
+```
+
+On macOS, install Homebrew GNU Make so `make` resolves to GNU Make 4.x:
+
+```bash
+brew install make
+PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
+```
+
+## Test targets
+
+| Target | What it runs | Requires |
+|--------|-------------|----------|
+| `make test` | Static tests (pytest) | Nothing |
+| `make test-unit` | Python unit tests + doctests + Go tests | Nothing (Go auto-downloads) |
+| `make test-integration PYTEST_ARGS="--image=<img>"` | Container integration tests | Podman/Docker |
+| `make test-<notebook>` | Notebook smoke test via papermill | kubectl + deployed workbench |
+
+### Deploying for notebook smoke tests
+
+`make test-<notebook>` requires a deployed workbench on OpenShift. For the full
+deploy/test/undeploy cycle, see [README.md § Notebooks](../../README.md#notebooks)
+and [README.md § Runtimes](../../README.md#runtimes).
+
+## Test types and locations
+
+| Type | Location | Naming | Organization |
+|------|----------|--------|--------------|
+| Static / manifest | `tests/test_*.py` | Module-level functions | Group with `subtests` |
+| Unit | `tests/unit/` | `test_*.py` mirroring source layout | Module-level functions |
+| Container integration | `tests/containers/` | `*_test.py` (class-based) | `Test*` classes with fixtures |
+| Browser E2E | `tests/browser/tests/` | `*.spec.ts` | Playwright + pnpm |
+| Go | `scripts/buildinputs/` | Standard Go test files | `make test-unit` runs these |
+| K8s notebook smoke | `scripts/` | Shell scripts | `make test-<notebook>` |
+
+### Collection behavior
+
+- `tests/containers/` is **excluded from default collection** via `collect_ignore` in
+  `tests/conftest.py`. Run container tests explicitly with `pytest tests/containers --image=<img>`.
+- Default `make test` collects from `tests/`, `ntb/`, and `ci/` (doctests).
+- `--strict-markers` is on — unregistered markers fail the run.
+
+## Markers
+
+All markers must be registered in `pytest.ini`:
+
+| Marker | Meaning | Excluded from default run |
+|--------|---------|--------------------------|
+| `openshift` | Needs live OpenShift cluster | Yes |
+| `cuda` | Needs NVIDIA GPU | Yes |
+| `rocm` | Needs AMD GPU | Yes |
+| `manifest_validation` | Slow registry/skopeo checks | Yes |
+| `buildonlytest` | Runs inside docker build only | Yes (different filter) |
+| `codeserver` | Code-Server workbench specific | No |
+
+## CI parity
+
+Local `make test` + `make test-unit` covers the `pytest-tests` job in
+`.github/workflows/code-quality.yaml`. Other CI checks that are **not yet**
+exposed as `make` targets:
+
+- yamllint (inline in workflow)
+- hadolint (inline in workflow)
+- gotestsum (inline in workflow)
+- prek (inline in workflow)
+
+Closing this gap (moving inline CI logic into Makefile targets) is tracked in
+[#3174](https://github.com/opendatahub-io/notebooks/issues/3174).
+
+### `check-generated-code` (lock scoping)
+
+The `check-generated-code` job runs `ci/generate_code.sh`, then verifies a clean working tree with `git status --porcelain`.
+
+- **Pull requests:** lock regen is scoped to image directories whose lock chain the PR
+  touched (`pyproject.toml`, `pylock.toml`, `requirements.*.txt`, or `uv.lock.d/*`). If the PR only changes
+  unrelated files, `pylocks_generator` is skipped so external AIPCC index churn does not
+  fail the job. Shared inputs (`dependencies/constraints.txt`, `dependencies/overrides.txt`, lock generator scripts)
+  still trigger full lock regen. CI fetches base and PR head refs (same pattern as
+  `build-notebooks-pr.yaml`), then runs `pylocks_generator --pr-base origin/<base-branch>
+  --pr-to-ref <pr-branch>` with `gha_pr_changed_files.list_changed_files()` (`git diff`
+  three-dot). Locally: `bash ci/generate_code.sh --pr-base origin/main` (default head: `HEAD`).
+  See [RHAIENG-6397](https://redhat.atlassian.net/browse/RHAIENG-6397).
+- **Push** (`main`, `stable`, `rhoai-*`): full lock regen for all image dirs (unchanged).
+
+## Frameworks and tools
+
+| Tool | Purpose |
+|------|---------|
+| pytest | Test runner for all Python tests |
+| pytest-subtests | Granular sub-assertions within a single test |
+| pytest-cov | Coverage (XML + terminal) |
+| allure-pytest | Issue tracking + step decoration |
+| hypothesis | Property-based tests for pure helpers (`tests/unit/test_property_helpers.py`) |
+| crosshair | Optional SMT backend for those Hypothesis tests (`make test-crosshair`) |
+| testcontainers | Container lifecycle for integration tests |
+| pyfakefs | Filesystem mocking for unit tests |
+| Playwright | Browser tests (TypeScript) |
+| papermill | Notebook execution verification |
+
+Hypothesis tests run in the normal `make test` / `make test-unit` pytest jobs
+(same `pytest-tests` CI job). There is no separate Hypothesis workflow: default
+`max_examples` is enough for PR CI. Raise examples locally when exploring
+(`settings(max_examples=...)` or a Hypothesis profile).
+
+### Optional CrossHair (SMT) backend
+
+CrossHair is **not** in the default `dev` install (pulls z3 ~37MB). Use it when you
+want a solver to hunt hard-to-reach branches in existing `@given` tests:
+
+```bash
+make test-crosshair
+# equivalent:
+uv sync --locked --group crosshair
+uv run pytest tests/unit/test_property_helpers.py --hypothesis-profile=crosshair
+```
+
+Do **not** enable `backend="crosshair"` on the default CI path: it is slower and the
+standard Hypothesis backend already covers PR gating. Standalone `crosshair check`
+needs explicit contracts (`pre:`/`post:`) and is not wired up yet.
+## Troubleshooting
+
+- **Container tests hang:** Ensure the container runtime (podman/docker) is running.
+  On Linux: `systemctl --user start podman.service`.
+- **Dependency conflicts after lock regen:** Run `make refresh-lock-files` and check
+  for "unsatisfiable" errors. See [docs/cves/python.md](../cves/python.md) for
+  constraint resolution.
+- **`make test` fails on stray files:** Extra top-level directories (`.cursor-tmp-*`)
+  break repo-wide assertions. Clean clone or `git clean -fdx` the offending paths.
+- **Security scanning:** Weekly Quay vulnerability reports are generated by
+  `ci/security-scan/quay_security_analysis.py` (triggered via `.github/workflows/sec-scan.yml`).
+
+## External test suites
+
+The images built by this repo are also tested by other projects:
+
+| Suite | Framework | What it tests |
+|-------|-----------|---------------|
+| [odh-dashboard](https://github.com/opendatahub-io/odh-dashboard/tree/main/packages/cypress/cypress/tests/e2e/dataScienceProjects/workbenches) | Cypress | Workbench CRUD, image selection, RBAC via ODH dashboard |
+| [ods-ci](https://github.com/red-hat-data-services/ods-ci/tree/master/ods_ci/tests/Tests/0500__ide) | Robot Framework | GPU/CUDA validation, Elyra pipelines, plugin consistency |
+| [opendatahub-tests](https://github.com/opendatahub-io/opendatahub-tests/tree/main/tests/workbenches) | Pytest | ImageStream health, Notebook CR spawning, package availability |
+
+## Package upgrade checklist
+
+When upgrading a Python package (PyTorch, TensorFlow, numpy, etc.) or adding a new
+dependency, follow these steps in order. Each layer catches a different class of
+problem — skipping a layer means that class of bug ships silently.
+
+### 1. Update the dependency and regenerate locks
+
+Edit the relevant `pyproject.toml` file(s), then regenerate lock files:
+
+```bash
+make refresh-lock-files
+```
+
+If the resolver fails with "unsatisfiable" errors, see
+[docs/cves/python.md](../cves/python.md) for constraint resolution.
+
+### 2. Run static tests
+
+```bash
+make test
+```
+
+**What this catches:** version mismatches between `pyproject.toml` files (e.g., you
+bumped numpy in one image but not another), broken lock files, Dockerfile alignment
+issues, manifest drift.
+
+Key tests in this layer:
+- `test_image_pyprojects_version_alignment` — ensures the same package uses
+  consistent version specifiers across all images
+- Dockerfile structure checks — validates multi-stage build consistency
+- Manifest validation — checks ImageStream definitions match expected metadata
+
+### 3. Run unit tests
+
+```bash
+make test-unit
+```
+
+**What this catches:** regressions in helper scripts (index URL resolution, lock file
+generation, CI tooling). These tests are fast and don't require containers.
+
+### 4. Build the affected image(s)
+
+```bash
+# Non-GPU images (minimal, datascience, trustyai):
+make jupyter-datascience-ubi9-python-3.12
+
+# CUDA GPU images (pytorch, tensorflow):
+make cuda-jupyter-pytorch-ubi9-python-3.12
+```
+
+GPU images require a `cuda-` or `rocm-` prefix on the target name.
+Set `PUSH_IMAGES=no` for local-only builds.
+
+**What this catches:** dependency conflicts at install time, missing system
+libraries, broken pip constraints. If the build fails, the package combination is
+not viable.
+
+Keep `KONFLUX` consistent between build and test steps (see
+[CONTRIBUTING.md § ODH vs RHOAI local builds](../../CONTRIBUTING.md#odh-vs-rhoai-local-builds)).
+
+### 5. Run container integration tests
+
+```bash
+make test-integration PYTEST_ARGS="--image=<image>"
+```
+
+where `<image>` is the full image reference from the build step (e.g.,
+`quay.io/opendatahub/workbench-images:jupyter-pytorch-ubi9-python-3.12-latest`).
+
+**What this catches:**
+- Entrypoint fails to start (JupyterLab/Code-Server doesn't come up)
+- Library import failures at runtime (numpy, pandas, sklearn, matplotlib, torch,
+  torchvision, feast, mlflow — see `tests/containers/workbenches/jupyterlab/libraries_testunits.py`)
+- GPU library loading issues for CUDA/ROCm images
+- Missing runtime dependencies that pip installed but the OS layer doesn't support
+
+### 6. Run manual test notebooks (GPU images)
+
+For GPU-accelerated images (PyTorch, TensorFlow), run the manual test notebooks
+inside a deployed workbench or locally with GPU passthrough:
+
+| Notebook | What it validates |
+|----------|-------------------|
+| `tests/manual/pytorch-test-notebook.ipynb` | PyTorch quickstart (data loading, model training, save/load), tensor operations on GPU |
+| `tests/manual/tensorflow-test.ipynb` | TensorFlow quickstart (MNIST training), GPU detection, nvidia-smi/hipcc, TensorBoard |
+| `tests/manual/gpu-test-notebook.ipynb` | General GPU availability and basic operations |
+
+These notebooks exercise real ML workflows end-to-end and catch problems that
+unit-level import checks miss (e.g., CUDA version incompatibilities, broken
+model serialization, silent CPU fallback).
+
+### 7. Run browser tests (if UI-affecting)
+
+If the upgrade could affect JupyterLab or Code-Server UI (e.g., upgrading
+`jupyterlab`, a JupyterLab extension, or `code-server`):
+
+```bash
+cd tests/browser && pnpm install --frozen-lockfile && pnpm exec playwright test
+```
+
+See [tests/browser/AGENTS.md](../../tests/browser/AGENTS.md) for setup details.
+
+**What this catches:** extension breakage, UI rendering regressions, IDE
+feature failures.
+
+### Quick reference
+
+| Change type | Minimum test layers |
+|-------------|-------------------|
+| Python library version bump | Steps 1–5 |
+| New Python dependency | Steps 1–5 |
+| GPU library upgrade (PyTorch, TF, CUDA) | Steps 1–6 |
+| JupyterLab / Code-Server / extension upgrade | Steps 1–5, 7 |
+| Dockerfile structural change | Steps 1–5 |
+| `pyproject.toml` constraint change only | Steps 1–3 |
+
+## Running images locally
+
+Build with a predictable tag and push disabled, then run:
+
+```bash
+# JupyterLab (port 8888)
+make jupyter-minimal-ubi9-python-3.12 IMAGE_TAG=latest PUSH_IMAGES=no
+podman run -it -p 8888:8888 quay.io/opendatahub/workbench-images:jupyter-minimal-ubi9-python-3.12-latest
+
+# Code-Server (port 8787)
+make codeserver-ubi9-python-3.12 IMAGE_TAG=latest PUSH_IMAGES=no
+podman run -it -p 8787:8787 quay.io/opendatahub/workbench-images:codeserver-ubi9-python-3.12-latest
+```
+
+For published image references, see the [README.md Image Inventory](../../README.md#image-inventory-list).
+Override the entrypoint to inspect an image without starting the workbench
+(see [AGENTS.md](../../AGENTS.md) operational notes).

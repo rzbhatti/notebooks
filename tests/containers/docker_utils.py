@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os.path
@@ -10,16 +11,64 @@ import time
 from os import PathLike
 from typing import TYPE_CHECKING
 
+import docker.client
+import docker.errors
 import podman
+import pytest
+import testcontainers.core.container
 
 import tests.containers.pydantic_schemas
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Generator, Iterable
 
-    import docker.client
-    import testcontainers.core.container
     from docker.models.containers import Container
+
+
+class BestEffortCleanup:
+    """Context manager that suppresses cleanup errors only when another exception is in-flight.
+
+    If cleanup raises and no other exception is active, the error propagates normally.
+    If cleanup raises while handling another exception, the error is logged and suppressed
+    so the original exception is not masked.
+
+    Design choices:
+
+    - Class-based, not @contextmanager: a generator-based CM's try/yield/except
+      catches body and cleanup exceptions indistinguishably.
+
+    - Auto-detection uses sys.exc_info() in __enter__, not __exit__: inside
+      __exit__, sys.exc_info() already reflects the cleanup error being handled,
+      not the original. Capturing in __enter__ gets the correct answer.
+
+    Usage in __exit__ (pass exc_type so auto-detect is skipped):
+        with BestEffortCleanup(exc_type):
+            container.stop()
+
+    Usage in @contextmanager finally (auto-detects via sys.exc_info):
+        with BestEffortCleanup():
+            container.stop()
+    """
+
+    def __init__(self, exc_type: type[BaseException] | None = None) -> None:
+        self._has_active_exception = exc_type is not None
+
+    def __enter__(self) -> None:
+        if not self._has_active_exception:
+            self._has_active_exception = sys.exc_info()[0] is not None
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> bool:
+        if exc_type is None:
+            return False
+        if not self._has_active_exception:
+            return False
+        logging.exception("Cleanup failed (suppressed because another exception is active)")
+        return True
 
 
 class NotebookContainer:
@@ -30,11 +79,31 @@ class NotebookContainer:
     def __init__(self, container: testcontainers.core.container.DockerContainer) -> None:
         self.testcontainer = container
 
+    def require_running(self, *, context: str = "after start") -> None:
+        wrapped = self.testcontainer.get_wrapped_container()
+        if wrapped is None:
+            pytest.fail(f"Container not started ({context})")
+        wrapped.reload()
+        if wrapped.status == "running":
+            return
+        pytest.fail(format_container_diagnostics(self.testcontainer, context=context))
+
+    def exec(self, command: str | list[str]):
+        try:
+            return self.testcontainer.exec(command)
+        except docker.errors.APIError as exc:
+            if _is_dead_container_exec_error(exc):
+                context = f"exec({command!r})"
+                pytest.fail(format_container_diagnostics(self.testcontainer, context=context))
+            raise
+
     def stop(self, timeout: int = 10):
         """Stop container with customizable timeout.
 
         DockerContainer.stop() has unchangeable 10s timeout between SIGSTOP and SIGKILL."""
-        self.testcontainer.get_wrapped_container().stop(timeout=timeout)
+        wrapped = self.testcontainer.get_wrapped_container()
+        if wrapped is not None:
+            wrapped.stop(timeout=timeout)
         self.testcontainer.stop()
 
     def wait_for_exit(self) -> int:
@@ -46,29 +115,126 @@ class NotebookContainer:
         return container.attrs["State"]["ExitCode"]
 
 
+_DEAD_CONTAINER_EXEC_PHRASES = (
+    "container state improper",
+    "is not running",
+    "container must be running",
+)
+
+
+def _container_logs_tail(container: Container, *, limit: int = 8000) -> str:
+    try:
+        logs = container.logs(stdout=True, stderr=True, tail=100)
+        if isinstance(logs, bytes):
+            text = logs.decode(errors="replace")
+        else:
+            text = b"".join(logs).decode(errors="replace")
+    except Exception as exc:
+        return f"<failed to read logs: {exc}>"
+    if len(text) > limit:
+        return f"...(truncated)...\n{text[-limit:]}"
+    return text
+
+
+def format_container_diagnostics(
+    container: testcontainers.core.container.DockerContainer,
+    *,
+    context: str,
+) -> str:
+    wrapped = container.get_wrapped_container()
+    if wrapped is None:
+        return f"Container not started ({context})"
+    wrapped.reload()
+    state = wrapped.attrs.get("State", {})
+    return "\n".join(
+        [
+            f"Container not running ({context})",
+            f"  status: {wrapped.status!r}",
+            f"  exit_code: {state.get('ExitCode')!r}",
+            f"  error: {state.get('Error')!r}",
+            f"  oom_killed: {state.get('OOMKilled')!r}",
+            "--- container logs (tail) ---",
+            _container_logs_tail(wrapped),
+        ]
+    )
+
+
+def _is_dead_container_exec_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    if isinstance(exc, docker.errors.APIError):
+        explanation = getattr(exc, "explanation", "") or ""
+        message = f"{message} {explanation}".lower()
+    return any(phrase in message for phrase in _DEAD_CONTAINER_EXEC_PHRASES)
+
+
+@contextlib.contextmanager
+def running_container(
+    image: str,
+    *,
+    user: int = 23456,
+    group_add: list[int] | None = None,
+    env: dict[str, str] | None = None,
+    **kwargs,
+) -> Generator[NotebookContainer]:
+    """Start a container with 'sleep infinity' and stop it on exit.
+
+    Yields a :class:`NotebookContainer` wrapper so callers get startup observability
+    (``require_running``) and dead-container diagnostics on ``exec``.
+
+    GID 0 is always added (OpenShift runs with root supplemental group for /opt/app-root access).
+    """
+    groups = sorted({0, *(group_add or [])})
+    container = testcontainers.core.container.DockerContainer(image=image, user=user, group_add=groups, **kwargs)
+    if env:
+        for key, value in env.items():
+            container.with_env(key, value)
+    container.with_command("/bin/sh -c 'sleep infinity'")
+    notebook = NotebookContainer(container)
+    try:
+        container.start()
+        notebook.require_running(context="after start")
+        yield notebook
+    finally:
+        with BestEffortCleanup():
+            notebook.stop(timeout=0)
+
+
 def container_cp(
-    container: Container, src: str | PathLike, dst: str, user: int | None = None, group: int | None = None
+    container: Container | NotebookContainer | testcontainers.core.container.DockerContainer,
+    src: str | PathLike,
+    dst: str,
+    user: int | None = None,
+    group: int | None = None,
 ) -> None:
     """
-    Copies a directory into a container
+    Copies a file or directory into a container.
+
+    Accepts a docker-py ``Container``, a :class:`NotebookContainer`, or a testcontainers
+    ``DockerContainer`` (the latter two are unwrapped — neither has ``put_archive``).
     From https://stackoverflow.com/questions/46390309/how-to-copy-a-file-from-host-to-container-using-docker-py-docker-sdk
     """
+    if isinstance(container, NotebookContainer):
+        container = container.testcontainer
+    if isinstance(container, testcontainers.core.container.DockerContainer):
+        container = container.get_wrapped_container()
+
     fh = io.BytesIO()
     tar = tarfile.open(fileobj=fh, mode="w:gz")
 
-    tar_filter = None
-    if user or group:
-
-        def tar_filter(f: tarfile.TarInfo) -> tarfile.TarInfo:
-            if user:
-                f.uid = user
-            if group:
-                f.gid = group
-            return f
+    def tar_filter(f: tarfile.TarInfo) -> tarfile.TarInfo:
+        if user is not None:
+            f.uid = user
+        if group is not None:
+            f.gid = group
+        return f
 
     logging.debug(f"Adding {src=} to archive {dst=}")
     try:
-        tar.add(src, arcname=os.path.basename(src), filter=tar_filter)
+        tar.add(
+            src,
+            arcname=os.path.basename(src),
+            filter=tar_filter if (user is not None or group is not None) else None,
+        )
     finally:
         tar.close()
 
@@ -84,7 +250,7 @@ def from_container_cp(container: Container, src: str, dst: str) -> None:
     fh.seek(0)
     tar = tarfile.open(fileobj=fh, mode="r")
     try:
-        tar.extractall(path=dst, filter=tarfile.data_filter)
+        tar.extractall(path=dst, filter=tarfile.data_filter)  # ruff: ignore[tarfile-unsafe-members] - data_filter rejects unsafe paths/symlinks (Python 3.12+ mitigation)
     finally:
         tar.close()
         fh.close()
@@ -135,7 +301,7 @@ def container_exec(
 
 
 class ContainerExec:
-    def __init__(self, client, id, output: list[int] | list[str]):
+    def __init__(self, client, id, output):
         self.client = client
         self.id = id
         self.output = output
@@ -192,7 +358,7 @@ def container_exec_with_stdin(
         stdout=True,
         stderr=True,
         tty=True,
-    )
+    )["Id"]
 
     # When using a podman client, exec_start(socket=True) returns a file-like
     # object (a wrapper around SocketIO), not a raw socket. We must use

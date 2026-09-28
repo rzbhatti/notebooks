@@ -9,25 +9,149 @@ import pprint
 import re
 import shutil
 import subprocess
+import sys
 import tomllib
 from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import allure
+import packaging.markers
 import packaging.requirements
+import packaging.specifiers
+import packaging.utils
 import packaging.version
 import pytest
 import yaml
 
+from manifests.tools.commit_env_refs import parse_env_file
+from manifests.tools.package_names import all_workbench_pip_names, manifest_name_to_pip
 from tests import PROJECT_ROOT, manifests
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from typing import Any
 
-    import pytest_subtests
+MAKE = shutil.which("gmake") or shutil.which("make") or "make"
 
-MAKE = shutil.which("gmake") or shutil.which("make")
+_LOG = logging.getLogger(__name__)
+
+# Bold yellow + reset; used for pylock mismatch headline and per-package summary lines when stderr is a TTY.
+_ANSI_YELLOW = "\033[1;33m"
+_ANSI_RESET = "\033[0m"
+_PYLOCK_MISMATCH_HEADLINE = "⚠️ Pylock version mismatches for allowed multispecifier packages"
+
+
+def _stderr_color_wrap_yellow(text: str) -> str:
+    if os.environ.get("NO_COLOR", "").strip():
+        return text
+    if not sys.stderr.isatty():
+        return text
+    return f"{_ANSI_YELLOW}{text}{_ANSI_RESET}"
+
+
+# Normalized PyPI names: allowed to use different dependency specifiers across
+# pyproject.toml files. Pylock pins for these are still compared (warning-only)
+# in test_image_pyprojects_version_alignment — across all image pylocks (every
+# cpu/cuda/rocm/... file) so cross-workbench drift is visible.
+PYPROJECT_MULTISPEC_IGNORED_PACKAGES: frozenset[str] = frozenset(
+    {
+        "setuptools",
+        "wheel",
+        "tensorboard",
+        "torch",
+        "torchvision",
+        "triton",
+        "numpy",
+        "jupyterlab-lsp",
+        "transformers",
+        "datasets",
+        "accelerate",
+        "requests",
+    }
+)
+
+
+def _iter_image_pyproject_pylock_files() -> Iterator[pathlib.Path]:
+    """Yield every pylock.toml / uv.lock.d/pylock.*.toml for image and dependencies trees."""
+    for pyproject_path in PROJECT_ROOT.glob("**/pyproject.toml"):
+        directory = pyproject_path.parent
+        if not is_image_directory(directory) and not is_dependencies_directory(pyproject_path):
+            continue
+        lock_dir = directory / "uv.lock.d"
+        if lock_dir.is_dir():
+            yield from sorted(lock_dir.glob("pylock.*.toml"))
+        else:
+            yield pyproject_path.with_name("pylock.toml")
+
+
+def _warn_on_pylock_version_mismatch_for_packages(package_names: frozenset[str]) -> None:
+    """Log a warning when a package is pinned to different versions across image pylocks.
+
+    All ``pylock*.toml`` files are merged per package name (cpu, cuda, rocm, etc.), so
+    drift between workbench images appears under one ``Package`` section; lock path shows flavor.
+    """
+    versions_by_pkg: dict[str, dict[str, str]] = defaultdict(dict)
+    for lock_path in _iter_image_pyproject_pylock_files():
+        if not lock_path.is_file():
+            continue
+        doc = tomllib.loads(lock_path.read_text())
+        rel = str(lock_path.relative_to(PROJECT_ROOT))
+        for pkg in doc.get("packages", []):
+            name = pkg.get("name")
+            version = pkg.get("version")
+            if name is None or version is None or name not in package_names:
+                continue
+            versions_by_pkg[name][rel] = version
+
+    mismatches: list[tuple[str, dict[str, str]]] = []
+    for pkg_name in sorted(versions_by_pkg):
+        mapping = versions_by_pkg[pkg_name]
+        if len(set(mapping.values())) <= 1:
+            continue
+        mismatches.append((pkg_name, mapping))
+
+    if not mismatches:
+        return
+
+    lines: list[str] = [_stderr_color_wrap_yellow(_PYLOCK_MISMATCH_HEADLINE)]
+    for i, (pkg_name, mapping) in enumerate(mismatches):
+        if i:
+            lines.append("")
+        versions_joined = ", ".join(sorted(set(mapping.values())))
+        lines.append(_stderr_color_wrap_yellow(f"Package {pkg_name!r}"))
+        lines.append(_stderr_color_wrap_yellow(f"  Pinned versions: {versions_joined}"))
+        lines.append("  Per lockfile:")
+        for rel_path, ver in sorted(mapping.items()):
+            lines.append(f"    {rel_path}  ->  {ver}")
+    _LOG.warning("\n".join(lines))
+
+
+def _major_minor_from_version(version: str) -> str | None:
+    try:
+        parsed = packaging.version.Version(version)
+    except packaging.version.InvalidVersion:
+        return None
+    return f"{parsed.major}.{parsed.minor}"
+
+
+def _collect_pylock_major_minor_versions() -> dict[str, set[str]]:
+    """Collect major.minor lock pins across all image pylocks keyed by canonical package name."""
+    versions_by_pkg: dict[str, set[str]] = defaultdict(set)
+    for lock_path in _iter_image_pyproject_pylock_files():
+        if not lock_path.is_file():
+            continue
+        doc = tomllib.loads(lock_path.read_text())
+        for pkg in doc.get("packages", []):
+            name = pkg.get("name")
+            version = pkg.get("version")
+            if name is None or version is None:
+                continue
+            major_minor = _major_minor_from_version(version)
+            if major_minor is None:
+                continue
+            canonical_name = packaging.utils.canonicalize_name(name)
+            versions_by_pkg[canonical_name].add(major_minor)
+    return versions_by_pkg
 
 
 def test_dockerfiles_unintended_subscription_manager_pattern():
@@ -40,7 +164,6 @@ def test_dockerfiles_unintended_subscription_manager_pattern():
     pattern = re.compile(r"^[^#]*subscription-manager.[^#]*register")
 
     skip_dirs = (
-        PROJECT_ROOT / "rstudio/rhel9-python-3.12",  # RStudio Dockerfiles
         PROJECT_ROOT / "scripts/lockfile-generators",  # RPM lockfile image optionally uses subscription-manager
     )
     for file in PROJECT_ROOT.glob("**/Dockerfile*"):
@@ -56,15 +179,71 @@ def test_dockerfiles_unintended_subscription_manager_pattern():
                 )
 
 
-def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
+# PQC (OCP 5.0): every shipped image must enable post-quantum crypto. AIPCC
+# bases carry `update-crypto-policies --set DEFAULT:PQ` since 3.6-EA2, so
+# images FROM them inherit PQC; in-repo C9S bases under base-images/ set it
+# themselves (checked below). Any other base (e.g.
+# registry.redhat.io/rhel9/python-312) requires the explicit policy line.
+PQC_POLICY_RUN_RE = re.compile(r"update-crypto-policies\s+--set\s+DEFAULT:PQ")
+PQC_ENABLED_BASE_PREFIXES = (
+    "quay.io/aipcc/base-images/",
+    "quay.io/opendatahub/odh-base-image",  # built in-repo by base-images/
+)
+
+
+def _dockerfile_for_build_args_conf(conf: pathlib.Path) -> pathlib.Path | None:
+    """Map a build-args conf (cpu.conf / konflux.cuda.conf / ...) to its Dockerfile, if present."""
+    variant = conf.name.removesuffix(".conf")
+    dockerfile = conf.parent.parent / f"Dockerfile.{variant}"
+    return dockerfile if dockerfile.is_file() else None
+
+
+def test_dockerfiles_pqc_crypto_policy_coverage() -> None:
+    """Every shipped image must enable the post-quantum crypto policy (OCP 5.0 PQC mandate).
+
+    See RHOAIENG-84389. The policy must be set while running as root in a stage
+    of the final image (non-root `update-crypto-policies` fails with
+    "You must be root to run update-crypto-policies").
+    """
+    # In-repo C9S base images must set the policy themselves; images that
+    # FROM them (ODH workbenches/runtimes) inherit it.
+    for dockerfile in sorted(PROJECT_ROOT.glob("base-images/**/Dockerfile*")):
+        if not dockerfile.is_file():
+            continue
+        assert PQC_POLICY_RUN_RE.search(dockerfile.read_text()), (
+            f"{dockerfile.relative_to(PROJECT_ROOT)}: C9S base image must enable the post-quantum "
+            "crypto policy: add `RUN update-crypto-policies --set DEFAULT:PQ` while running as root."
+        )
+
+    for conf in sorted(PROJECT_ROOT.glob("**/build-args/*.conf")):
+        base_image = next(
+            (line.split("=", 1)[1].strip() for line in conf.read_text().splitlines() if line.startswith("BASE_IMAGE=")),
+            None,
+        )
+        if base_image is None:
+            continue
+        # repository without tag/digest
+        repository = base_image.split(":", 1)[0]
+        if repository.startswith(PQC_ENABLED_BASE_PREFIXES):
+            continue
+        dockerfile = _dockerfile_for_build_args_conf(conf)
+        if dockerfile is None:
+            continue
+        assert PQC_POLICY_RUN_RE.search(dockerfile.read_text()), (
+            f"{conf.relative_to(PROJECT_ROOT)}: base image {base_image} is not known to ship PQC, but "
+            f"{dockerfile.relative_to(PROJECT_ROOT)} does not run `update-crypto-policies --set DEFAULT:PQ`."
+        )
+
+
+@pytest.mark.parametrize("manifests_directory", [manifests.MANIFESTS_ODH_DIR, manifests.MANIFESTS_RHOAI_DIR])
+def test_image_pyprojects(subtests: pytest.Subtests, manifests_directory: pathlib.Path):
     for file in PROJECT_ROOT.glob("**/pyproject.toml"):
         logging.info(file)
         with subtests.test(msg="checking pyproject.toml", pipfile=file):
             directory = file.parent  # "ubi9-python-3.11"
-            try:
-                _ubi, _lang, python = directory.name.split("-")
-            except ValueError:
+            if not is_image_directory(directory):
                 pytest.skip(f"skipping {directory.name}/pyproject.toml as it is not an image directory")
+            _ubi, _lang, python = directory.name.split("-")
 
             pyproject = tomllib.loads(file.read_text())
             with subtests.test(msg="checking pyproject.toml", pyproject=file):
@@ -72,19 +251,68 @@ def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
                 assert "requires-python" in pyproject["project"], (
                     "pyproject.toml is missing a [project.requires-python] section"
                 )
-                assert pyproject["project"]["requires-python"] == f"=={python}.*", (
-                    "pyproject.toml does not declare the expected Python version"
+                major, minor = (int(v) for v in python.split("."))
+                requires_python_specifier = packaging.specifiers.SpecifierSet(pyproject["project"]["requires-python"])
+                assert requires_python_specifier.contains(f"{major}.{minor}.0", prereleases=True), (
+                    "pyproject.toml requires-python does not include the expected Python minor version"
+                )
+                if minor > 0:
+                    assert not requires_python_specifier.contains(f"{major}.{minor - 1}.0", prereleases=True), (
+                        "pyproject.toml requires-python must not include the previous Python minor version"
+                    )
+                assert not requires_python_specifier.contains(f"{major}.{minor + 1}.0", prereleases=True), (
+                    "pyproject.toml requires-python must not include the next Python minor version"
                 )
 
                 assert "dependencies" in pyproject["project"], (
                     "pyproject.toml is missing a [project.dependencies] section"
                 )
 
-            if (f := file.parent / "uv.lock.d").is_dir():
-                pylock = tomllib.loads(next(f.glob("pylock.*.toml")).read_text())
+                for dep_str in pyproject["project"]["dependencies"]:
+                    req = packaging.requirements.Requirement(dep_str)
+                    canonical = packaging.utils.canonicalize_name(req.name)
+                    assert req.name == canonical, (
+                        f"pyproject.toml dependency {req.name!r} is not canonical; should be {canonical!r}"
+                    )
+
+            uv_lock_d = file.parent / "uv.lock.d"
+            standalone_pylock = file.with_name("pylock.toml")
+            assert not (uv_lock_d.is_dir() and standalone_pylock.is_file()), (
+                f"Both {uv_lock_d} and {standalone_pylock} exist. "
+                f"These lock formats are mutually exclusive — having both means one is stale "
+                f"and was not regenerated by pylocks_generator.py. "
+                f"Delete the outdated file and re-run 'gmake refresh-lock-files'."
+            )
+
+            if uv_lock_d.is_dir():
+                pylock_candidates = sorted(uv_lock_d.glob("pylock.*.toml"))
+                assert pylock_candidates, (
+                    f"uv.lock.d directory exists at {uv_lock_d} but contains no pylock.*.toml files. "
+                    f"This likely means pylocks_generator.py failed. "
+                    f"Delete the empty uv.lock.d directory or re-run the lockfile generator."
+                )
+                pylock = tomllib.loads(pylock_candidates[0].read_text())
             else:
-                pylock = tomllib.loads(file.with_name("pylock.toml").read_text())
-            pylock_packages: dict[str, dict[str, Any]] = {p["name"]: p for p in pylock["packages"]}
+                pylock = tomllib.loads(standalone_pylock.read_text())
+            # Filter packages by marker against the target Python version (universal locks
+            # can fork the same package into multiple entries with mutually exclusive markers).
+            # Pin platform_machine to x86_64: public-index Jupyter deps use Path B allowlist
+            # ``== 'x86_64' or == 'aarch64'``. Host macOS reports ``arm64``, which is not
+            # ``aarch64``, so those packages would otherwise vanish from the filtered lock.
+            marker_env = {
+                "python_full_version": f"{python}.0",
+                "implementation_name": "cpython",
+                "sys_platform": "linux",
+                "platform_machine": "x86_64",
+            }
+            pylock_packages: dict[str, dict[str, Any]] = {}
+            for p in pylock["packages"]:
+                if "marker" in p and not packaging.markers.Marker(p["marker"]).evaluate(marker_env):
+                    continue
+                assert p["name"] not in pylock_packages, (
+                    f"Duplicate package {p['name']} in pylock after marker filtering for Python {python}"
+                )
+                pylock_packages[p["name"]] = p
             with subtests.test(msg="checking pylock.toml consistency with pyproject.toml", pyproject=file):
                 for d in pyproject["project"]["dependencies"]:
                     requirement = packaging.requirements.Requirement(d)
@@ -104,14 +332,22 @@ def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
                         f"Version missing for {requirement.name} in pylock.toml"
                     )
                     version = pylock_packages[requirement.name]["version"]
-                    assert requirement.specifier.contains(version), (
-                        f"Version of {d} in pyproject.toml does not match {version=} in pylock.toml"
-                    )
+                    if requirement.specifier:
+                        assert requirement.specifier.contains(version), (
+                            f"Version of {d} in pyproject.toml does not match {version=} in pylock.toml"
+                        )
 
             with subtests.test(msg="checking imagestream manifest consistency with pylock.toml", pyproject=file):
-                _skip_unimplemented_manifests(directory)
+                _skip_unimplemented_manifests(directory, manifests_directory)
 
-                manifest = load_manifests_file_for(directory)
+                manifest = load_manifests_file_for(directory, manifests_directory)
+
+                workbench_only_packages = [
+                    "Kfp",
+                    "JupyterLab",
+                    "Odh-Elyra",
+                    "Codeflare-SDK",
+                ]
 
                 with subtests.test(msg="checking the `notebook-software` array", pyproject=file):
                     for s in manifest.sw:
@@ -123,8 +359,14 @@ def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
                             # TODO(jdanek): check not implemented yet
                             continue
                         elif s.get("name") in ("CUDA", "ROCm"):
-                            # TODO(jdanek): check not implemented yet
-                            continue
+                            expected_version = get_accelerator_version_for_directory(directory, s["name"])
+                            if expected_version is None:
+                                continue
+                            manifest_version = s.get("version", "").lstrip("v")
+                            assert manifest_version == expected_version, (
+                                f"{s['name']} version in imagestream ({s.get('version')}) does not match "
+                                f"build-args version ({expected_version})"
+                            )
                         else:
                             e = next((dep for dep in manifest.dep if dep.get("name") == s.get("name")), None)
                             if e:
@@ -132,74 +374,25 @@ def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
                             else:
                                 pytest.fail(f"unexpected {s=}")
 
+                with subtests.test(msg="checking accelerator versions for all variants", pyproject=file):
+                    _check_all_accelerator_variants(directory, manifests_directory, subtests)
+
                 with subtests.test(msg="checking the `notebook-python-dependencies` array", pyproject=file):
                     for d in manifest.dep:
-                        workbench_only_packages = [
-                            "Kfp",
-                            "JupyterLab",
-                            "Odh-Elyra",
-                            "Kubeflow-Training",
-                            "Codeflare-SDK",
-                        ]
-
-                        # complex translation from names used in imagestream manifest to python package name
-                        manifest_to_pylock_translation = {
-                            # TODO(jdanek): is this one intentional?
-                            "LLM-Compressor": "llmcompressor",
-                            "PyTorch": "torch",
-                            "ROCm-PyTorch": "torch",
-                            "Sklearn-onnx": "skl2onnx",
-                            "Nvidia-CUDA-CU12-Bundle": "nvidia-cuda-runtime-cu12",
-                            "MySQL Connector/Python": "mysql-connector-python",
-                        }
-
-                        # when .lower() is all it takes to do the translation
-                        manifest_to_pylock_capitalization: set[str] = {
-                            "Accelerate",
-                            "Boto3",
-                            "Codeflare-SDK",
-                            "Datasets",
-                            "Feast",
-                            "JupyterLab",
-                            "Kafka-Python-ng",
-                            "Kfp",
-                            "Kubeflow-Training",
-                            "Matplotlib",
-                            "Numpy",
-                            "Odh-Elyra",
-                            "Pandas",
-                            "Psycopg",
-                            "PyMongo",
-                            "Pyodbc",
-                            "Scikit-learn",
-                            "Scipy",
-                            "TensorFlow",
-                            "Tensorboard",
-                            # TODO(jdanek): inconsistent with PyTorch elsewhere
-                            "Torch",
-                            "Transformers",
-                            "TrustyAI",
-                            "TensorFlow-ROCm",
-                        }
-
                         name = d["name"]
                         if name in workbench_only_packages and manifest.metadata.type == manifests.NotebookType.RUNTIME:
                             continue
 
-                        # TODO(jdanek): intentional?
-                        if manifest.metadata.scope == "pytorch+llmcompressor" and name == "Codeflare-SDK":
+                        # Runtime llmcompressor currently resolves via lm-eval constraints to 0.9.x
+                        # while the workbench line can resolve to 0.10.x.
+                        if (
+                            manifest.metadata.scope == "pytorch+llmcompressor"
+                            and manifest.metadata.type == manifests.NotebookType.RUNTIME
+                            and name == "LLM-Compressor"
+                        ):
                             continue
 
-                        if name == "rstudio-server":
-                            # TODO(jdanek): figure out how to check rstudio version statically
-                            continue
-
-                        if name in manifest_to_pylock_translation:
-                            normalized_name = manifest_to_pylock_translation[name]
-                        elif name in manifest_to_pylock_capitalization:
-                            normalized_name = name.lower()
-                        else:
-                            normalized_name = name
+                        normalized_name = manifest_name_to_pip(name)
 
                         # assert on name
 
@@ -212,6 +405,8 @@ def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
 
                         manifest_version = d.get("version")
                         locked_version = resolved.get("version")
+                        assert manifest_version is not None, f"{name}: missing version in manifest"
+                        assert locked_version is not None, f"{name}: missing version in pylock.toml"
 
                         split_manifest_version = re.fullmatch(r"^v?(\d+)\.(\d+)", manifest_version)
                         assert split_manifest_version is not None, f"{name}: malformed {manifest_version=}"
@@ -222,9 +417,40 @@ def test_image_pyprojects(subtests: pytest_subtests.plugin.SubTests):
                             f"{name}: manifest {manifest.filename} declares {manifest_version}, but pylock.toml pins {locked_version}"
                         )
 
+                with subtests.test(msg="checking pylock workbench packages are listed in manifest", pyproject=file):
+                    known_pip_names = all_workbench_pip_names()
+                    manifest_pip_names = {manifest_name_to_pip(d["name"]).lower() for d in manifest.dep}
+                    workbench_only_pip = {manifest_name_to_pip(n).lower() for n in workbench_only_packages}
+                    direct_deps = set()
+                    for d in pyproject["project"]["dependencies"]:
+                        req = packaging.requirements.Requirement(d)
+                        if not is_subproject_metapackage(req.name):
+                            direct_deps.add(req.name.lower())
+                    for pip_name in pylock_packages:
+                        if pip_name.lower() not in known_pip_names:
+                            continue
+                        if (
+                            manifest.metadata.type == manifests.NotebookType.RUNTIME
+                            and pip_name.lower() in workbench_only_pip
+                        ):
+                            continue
+                        if pip_name.lower() not in manifest_pip_names:
+                            with subtests.test(msg="missing manifest package", package=pip_name, pyproject=file):
+                                pytest.fail(
+                                    f"{pip_name} is in pylock.toml but missing from manifest {manifest.filename}"
+                                    + (
+                                        " (direct pyproject.toml dependency)"
+                                        if pip_name.lower() in direct_deps
+                                        else " (transitive; list in notebook-python-dependencies)"
+                                    )
+                                )
 
-def test_image_manifests_version_alignment(subtests: pytest_subtests.plugin.SubTests):
+
+@pytest.mark.parametrize("manifests_directory", [manifests.MANIFESTS_ODH_DIR, manifests.MANIFESTS_RHOAI_DIR])
+def test_image_manifests_version_alignment(subtests: pytest.Subtests, manifests_directory: pathlib.Path):
+    """Check recommended-tag package versions across imagestreams, allowing lockfile-backed rolling drifts."""
     collected_manifests = []
+    pylock_major_minor_versions = _collect_pylock_major_minor_versions()
     for file in PROJECT_ROOT.glob("**/pyproject.toml"):
         logging.info(file)
         directory = file.parent  # "ubi9-python-3.11"
@@ -232,10 +458,10 @@ def test_image_manifests_version_alignment(subtests: pytest_subtests.plugin.SubT
             logging.debug(f"skipping {directory.name}/pyproject.toml as it is not an image directory")
             continue
 
-        if _skip_unimplemented_manifests(directory, call_skip=False):
+        if _skip_unimplemented_manifests(directory, manifests_directory, call_skip=False):
             continue
 
-        manifest = load_manifests_file_for(directory)
+        manifest = load_manifests_file_for(directory, manifests_directory)
         collected_manifests.append(manifest)
 
     @dataclasses.dataclass
@@ -253,19 +479,24 @@ def test_image_manifests_version_alignment(subtests: pytest_subtests.plugin.SubT
     # TODO(jdanek): review these, if any are unwarranted
     ignored_exceptions: tuple[tuple[str, tuple[str, ...]], ...] = (
         # ("package name", ("allowed version 1", "allowed version 2", ...))
-        ("Codeflare-SDK", ("0.34", "0.35")),
+        ("JupyterLab", ("4.5", "4.6")),
+        ("Matplotlib", ("3.10", "3.11")),
+        ("MLflow", ("3.14", "3.15")),
+        ("Kfp", ("2.15", "2.16")),
+        ("Feast", ("0.63", "0.65")),  # codeserver still on 0.63; others refreshed to 0.65
         ("Scikit-learn", ("1.7", "1.6")),
-        ("Pandas", ("2.3", "1.5")),
+        ("Scipy", ("1.16", "1.17")),
+        ("Pandas", ("3.0", "2.3")),
+        ("PyMongo", ("4.16", "4.17")),
         (
             "Numpy",
             (
-                "2.0",  # for tensorflow rocm (numpy 2.0.2)
-                "2.3",  # this used to be our latest
-                "2.4",  # this is our latest where possible
+                "2.4",  # llmcompressor
+                "2.5",  # latest where possible
             ),
         ),
-        ("Tensorboard", ("2.18", "2.20")),
-        ("PyTorch", ("2.7", "2.9")),
+        ("Tensorboard", ("2.19", "2.20")),
+        ("PyTorch", ("2.9", "2.10")),
     )
 
     for name, data in packages.items():
@@ -285,11 +516,23 @@ def test_image_manifests_version_alignment(subtests: pytest_subtests.plugin.SubT
                     f"Manifest breakdown: {pprint.pformat(mapping)}"
                 )
                 continue
+            pip_name = packaging.utils.canonicalize_name(manifest_name_to_pip(name))
+            pylock_versions = pylock_major_minor_versions.get(pip_name, set())
+            if len(pylock_versions) > 1 and set(versions).issubset(pylock_versions):
+                _LOG.warning(
+                    "Allowing rolling latest-tag version drift for %s; manifest versions=%s, pylock versions=%s. "
+                    "Manifest breakdown: %s",
+                    name,
+                    sorted(set(versions)),
+                    sorted(pylock_versions),
+                    pprint.pformat(mapping),
+                )
+                continue
             # all hope is lost, the check has failed
             pytest.fail(f"{name} has multiple versions: {pprint.pformat(mapping)}")
 
 
-def test_image_pyprojects_version_alignment(subtests: pytest_subtests.plugin.SubTests):
+def test_image_pyprojects_version_alignment(subtests: pytest.Subtests):
     requirements = defaultdict(list)
     for file in PROJECT_ROOT.glob("**/pyproject.toml"):
         logging.info(file)
@@ -304,63 +547,46 @@ def test_image_pyprojects_version_alignment(subtests: pytest_subtests.plugin.Sub
             requirement = packaging.requirements.Requirement(d)
             requirements[requirement.name].append(requirement.specifier)
 
-    # list of packages and their versions where we need to have multiple versions of the same package
-    #  do not add/maintain entries with a single version here, delete such items directly
-    ignored_exceptions: tuple[tuple[str, tuple[str, ...]], ...] = (
-        # ("package name", ("allowed specifier 1", "allowed specifier 2", ...))
-        ("setuptools", ("~=80.9.0", "==80.9.0")),
-        ("wheel", ("==0.46.3", "~=0.46.3")),
-        ("tensorboard", ("~=2.18.0", "~=2.20.0")),
-        ("torchvision", ("==0.24.1", "~=0.24.1")),
-        ("triton", ("~=3.5.1", "==3.5.1")),
-        (
-            "numpy",
-            (
-                ">=1.26.4",  # allow the latest possible, see the pylock.toml check for precise pins
-                "==2.3.5",  # llmcompressor pins exact version
-            ),
-        ),
-        ("jupyterlab-lsp", ("~=5.1.0", "~=5.1.1")),
-        ("transformers", ("~=5.0.0", "==4.57.3")),
-        ("datasets", ("~=4.5.0", "==4.4.1")),
-        ("accelerate", ("~=1.12.0", "==1.12.0")),
-        ("requests", ("~=2.32.5", "==2.32.5")),
-    )
+    with subtests.test(
+        msg=(
+            "pylock.toml pinned versions for multispecifier-ignored packages "
+            "(compare across all image lockfiles; logging.warning if pins differ)"
+        )
+    ):
+        _warn_on_pylock_version_mismatch_for_packages(PYPROJECT_MULTISPEC_IGNORED_PACKAGES)
 
     for name, data in requirements.items():
-        exception = next((it for it in ignored_exceptions if it[0] == name), None)
         actual_specs = {str(spec) for spec in data}
+        # Unpinned specs are intentionally version-agnostic and should not
+        # trigger alignment failures on their own.
+        non_empty_specs = {spec for spec in actual_specs if spec}
 
-        if len(actual_specs) == 1:
-            # Only one version found - check we're not expecting multiple
-            assert not (exception and len(exception[1]) > 1), (
-                f"{name} now has single specifier {actual_specs} but ignored_exceptions expects multiple: {set(exception[1])}. "
-                f"Please update ignored_exceptions."
-            )
+        if len(non_empty_specs) <= 1:
             continue
 
-        with subtests.test(msg=f"checking versions of {name} across all pyproject.tomls"):
-            if exception:
-                # exception may save us from failing
-                expected_specs = set(exception[1])
-                assert actual_specs == expected_specs, (
-                    f"{name} is allowed to have {expected_specs} but actually has {actual_specs}"
-                )
-                continue
+        # Multispecifier packages are intentionally allowed to differ in pyproject.toml;
+        # their pylock pins are checked above (warning-only).
+        if name in PYPROJECT_MULTISPEC_IGNORED_PACKAGES:
+            continue
+
+        with subtests.test(
+            msg=(f"checking pyproject [project.dependencies] specifiers for {name} across pyproject.toml files")
+        ):
             # all hope is lost, the check has failed
-            pytest.fail(f"{name} has multiple specifiers: {pprint.pformat(data)}")
+            pytest.fail(
+                f"{name} has multiple non-empty specifiers across pyproject.toml files: "
+                f"{non_empty_specs}. Full breakdown: {pprint.pformat(data)}"
+            )
 
 
-def test_files_that_should_be_same_are_same(subtests: pytest_subtests.plugin.SubTests):
+def test_files_that_should_be_same_are_same(subtests: pytest.Subtests):
     file_groups = {
         "ROCm de-vendor script": [
-            PROJECT_ROOT / "jupyter/rocm/pytorch/ubi9-python-3.12/de-vendor-torch.sh",
-            PROJECT_ROOT / "runtimes/rocm-pytorch/ubi9-python-3.12/de-vendor-torch.sh",
+            PROJECT_ROOT / "jupyter/rocm/pytorch/ubi9-python-3.12/de-vendor-torch.py",
+            PROJECT_ROOT / "runtimes/rocm-pytorch/ubi9-python-3.12/de-vendor-torch.py",
         ],
         "nginx/common.sh": [
             PROJECT_ROOT / "codeserver/ubi9-python-3.12/nginx/root/usr/share/container-scripts/nginx/common.sh",
-            PROJECT_ROOT / "rstudio/c9s-python-3.12/nginx/root/usr/share/container-scripts/nginx/common.sh",
-            PROJECT_ROOT / "rstudio/rhel9-python-3.12/nginx/root/usr/share/container-scripts/nginx/common.sh",
         ],
     }
     for group_name, (first_file, *rest) in file_groups.items():
@@ -371,14 +597,12 @@ def test_files_that_should_be_same_are_same(subtests: pytest_subtests.plugin.Sub
 
 
 @allure.issue("RHOAIENG-42632")
-def test_rhds_pipelines_use_rhds_args(subtests: pytest_subtests.plugin.SubTests):
-    r"""Pipelines under .tekton/ that build `^Dockerfile\.konflux.*` dockerfiles have to use
-    `^konflux\..*` args files. For example, this would be a violation of the rule:
+def test_rhds_pipelines_use_rhds_args(subtests: pytest.Subtests):
+    r"""RHDS pipelines (output-image under quay.io/rhoai/) must pair Dockerfile.konflux.*
+    with konflux.* build-args conf files.
 
-    - name: dockerfile
-      value: jupyter/rocm/tensorflow/ubi9-python-3.12/Dockerfile.konflux.rocm
-    - name: build-args-file
-      value: jupyter/rocm/tensorflow/ubi9-python-3.12/build-args/rocm.conf
+    ODH pipelines publish to quay.io/opendatahub/ and use build-args/<variant>.conf even
+    when building Dockerfile.konflux.* — that pairing is valid and not checked here.
     """
     for file in PROJECT_ROOT.glob(".tekton/*.yaml"):
         with subtests.test(msg="checking tekton pipeline", pipeline=file):
@@ -388,21 +612,38 @@ def test_rhds_pipelines_use_rhds_args(subtests: pytest_subtests.plugin.SubTests)
                 continue
             assert pipeline["kind"] == "PipelineRun", f"Expected PipelineRun, got {pipeline['kind']}"
 
+            pipeline_type = (
+                pipeline.get("metadata", {}).get("labels", {}).get("pipelines.appstudio.openshift.io/type", "")
+            )
+            assert pipeline_type in ("build", "test"), (
+                f"Pipeline {file.relative_to(PROJECT_ROOT)} has unexpected type {pipeline_type!r}"
+            )
+            if pipeline_type != "build":
+                continue
+
             dockerfile_param = None
             build_args_file_param = None
+            output_image_param = None
 
             for param in pipeline["spec"]["params"]:
                 if param["name"] == "dockerfile":
                     dockerfile_param = pathlib.Path(param["value"])
                 if param["name"] == "build-args-file":
                     build_args_file_param = pathlib.Path(param["value"])
+                if param["name"] == "output-image":
+                    output_image_param = param["value"]
+
+            if not output_image_param or not str(output_image_param).startswith("quay.io/rhoai/"):
+                continue
 
             assert dockerfile_param is not None, (
                 f"Pipeline {file.relative_to(PROJECT_ROOT)} is missing the required 'dockerfile' parameter"
             )
 
-            if not dockerfile_param.name.startswith("Dockerfile.konflux"):
-                continue
+            assert dockerfile_param.name.startswith("Dockerfile.konflux"), (
+                f"Pipeline {file.relative_to(PROJECT_ROOT)} publishes to quay.io/rhoai/ "
+                f"but does not use a Dockerfile.konflux.* ({dockerfile_param.name})"
+            )
 
             assert build_args_file_param is not None, (
                 f"Pipeline {file.relative_to(PROJECT_ROOT)} builds a konflux Dockerfile ({dockerfile_param.name}) "
@@ -414,7 +655,24 @@ def test_rhds_pipelines_use_rhds_args(subtests: pytest_subtests.plugin.SubTests)
             )
 
 
-CANONICAL_TAG_ORDER = ["3.4", "2025.2", "2025.1", "2024.2", "2024.1", "2023.2", "2023.1", "1.2"]
+_BASE_CANONICAL_TAG_ORDER = ["3.5", "3.4", "2025.2", "2025.1", "2024.2", "2024.1", "2023.2", "2023.1", "1.2"]
+
+
+def _canonical_tag_order_from_versions_config() -> list[str]:
+    versions_config = yaml.safe_load((PROJECT_ROOT / "versions_config.yml").read_text())
+    release = versions_config.get("release", {})
+    full_version = release.get("full_version")
+    if not isinstance(full_version, str):
+        raise ValueError("versions_config.yml release.full_version must be a string")
+
+    release_major_minor = _major_minor_from_version(full_version)
+    if release_major_minor is None:
+        raise ValueError(f"versions_config.yml release.full_version is invalid: {full_version!r}")
+
+    return [release_major_minor, *[tag for tag in _BASE_CANONICAL_TAG_ORDER if tag != release_major_minor]]
+
+
+CANONICAL_TAG_ORDER = _canonical_tag_order_from_versions_config()
 
 _PLACEHOLDER_RE = re.compile(
     r"""
@@ -432,23 +690,11 @@ _PLACEHOLDER_RE = re.compile(
 )
 
 
-def _parse_env_keys(env_path: pathlib.Path) -> set[str]:
-    keys: set[str] = set()
-    if not env_path.exists():
-        return keys
-    for line in env_path.read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        key, _, _ = line.partition("=")
-        keys.add(key.strip())
-    return keys
-
-
-def test_imagestream_kustomization_consistency(subtests: pytest_subtests.plugin.SubTests):
+@pytest.mark.parametrize(
+    "base_dir", [PROJECT_ROOT / "manifests" / "odh" / "base", PROJECT_ROOT / "manifests" / "rhoai" / "base"]
+)
+def test_imagestream_kustomization_consistency(subtests: pytest.Subtests, base_dir):
     """Validate that imagestream YAML files, kustomization.yaml replacements, and .env files are consistent."""
-    base_dir = PROJECT_ROOT / "manifests" / "base"
-
     kustomization = yaml.safe_load((base_dir / "kustomization.yaml").read_text())
     replacements = kustomization.get("replacements", [])
 
@@ -477,8 +723,12 @@ def test_imagestream_kustomization_consistency(subtests: pytest_subtests.plugin.
                     )
                     commit_replacements[key] = field_path_key
 
-    param_env_keys = _parse_env_keys(base_dir / "params.env") | _parse_env_keys(base_dir / "params-latest.env")
-    commit_env_keys = _parse_env_keys(base_dir / "commit.env") | _parse_env_keys(base_dir / "commit-latest.env")
+    param_env_keys = set(parse_env_file(base_dir / "params.env").keys()) | set(
+        parse_env_file(base_dir / "params-latest.env").keys()
+    )
+    commit_env_keys = set(parse_env_file(base_dir / "commit.env").keys()) | set(
+        parse_env_file(base_dir / "commit-latest.env").keys()
+    )
 
     for is_file in sorted(base_dir.glob("*-imagestream.yaml")):
         is_data = yaml.safe_load(is_file.read_text())
@@ -668,28 +918,118 @@ def is_subproject_metapackage(package_name: str) -> bool:
     return package_name.startswith("odh-notebooks-meta-") and package_name.endswith("-deps")
 
 
-def _skip_unimplemented_manifests(directory: pathlib.Path, call_skip=True) -> bool:
-    unimplemented_dirs = ()
-    for d in unimplemented_dirs:
-        if is_suffix(directory.parts, pathlib.Path(d).parts):
-            if call_skip:
-                pytest.skip(f"Manifest not implemented {directory.parts}")
-            else:
+_ODH_ONLY_MANIFEST_DIRS = (
+    "codeserver-baseline",
+    "jupyter/baseline",
+    "runtimes/baseline",
+)
+
+
+def _skip_unimplemented_manifests(
+    directory: pathlib.Path,
+    manifests_directory: pathlib.Path | None = None,
+    call_skip: bool = True,
+) -> bool:
+    """Skip image dirs with no manifest in the selected product tree.
+
+    Baseline workbench/runtime images ship on ODH only; RHOAI has no imagestream manifests for them.
+    """
+    if manifests_directory == manifests.MANIFESTS_RHOAI_DIR:
+        rel_parts = directory.relative_to(PROJECT_ROOT).parts
+        for d in _ODH_ONLY_MANIFEST_DIRS:
+            prefix_parts = pathlib.Path(d).parts
+            if len(rel_parts) >= len(prefix_parts) and rel_parts[: len(prefix_parts)] == prefix_parts:
+                if call_skip:
+                    pytest.skip(f"Baseline manifests are ODH-only (no RHOAI manifest for {directory.parts})")
                 return True
     return False
 
 
 def is_image_directory(directory: pathlib.Path) -> bool:
     """image directory e.g. "ubi9-python-3.11"""
-    try:
-        _ubi, _lang, _python = directory.name.split("-")
-        return True
-    except ValueError:
+    if re.fullmatch(r"ubi9-python-\d+\.\d+", directory.name) is None:
         return False
+    return (directory / "build-args").is_dir()
+
+
+def test_is_image_directory_accepts_expected_pattern(tmp_path: pathlib.Path) -> None:
+    directory = tmp_path / "ubi9-python-3.12"
+    (directory / "build-args").mkdir(parents=True)
+
+    assert is_image_directory(directory)
+
+
+def test_is_image_directory_rejects_lookalike_three_token_name(tmp_path: pathlib.Path) -> None:
+    directory = tmp_path / "foo-bar-baz"
+    (directory / "build-args").mkdir(parents=True)
+
+    assert not is_image_directory(directory)
 
 
 def is_dependencies_directory(file: pathlib.Path) -> bool:
     return "dependencies" in file.relative_to(PROJECT_ROOT).parts
+
+
+def get_accelerator_version_for_directory(directory: pathlib.Path, accelerator_name: str) -> str | None:
+    """Parse the CUDA/ROCm version from BASE_IMAGE, if the tag encodes it."""
+    flavor = accelerator_name.lower()
+    conf_file = directory / "build-args" / f"konflux.{flavor}.conf"
+    env = parse_env_file(conf_file)
+    base_image = env.get("BASE_IMAGE", "")
+    if re.search(
+        rf"{re.escape(flavor)}-stable:\d+\.\d+\.\d+(?:-\d+)?$|{re.escape(flavor)}-[^:]+:\d+\.\d+\.\d+-stable-\d+$",
+        base_image,
+        flags=re.IGNORECASE,
+    ):
+        return None
+    match = re.search(rf"{re.escape(flavor)}-v?(\d+\.\d+)", base_image, flags=re.IGNORECASE)
+    if not match:
+        raise ValueError(f"Cannot extract {accelerator_name} version from {conf_file}: BASE_IMAGE={base_image}")
+    return match.group(1)
+
+
+def test_get_accelerator_version_for_directory_returns_none_for_gpu_stable_tag(tmp_path: pathlib.Path):
+    directory = tmp_path / "jupyter" / "minimal" / "ubi9-python-3.12"
+    conf_file = directory / "build-args" / "konflux.cuda.conf"
+    conf_file.parent.mkdir(parents=True)
+    conf_file.write_text("BASE_IMAGE=quay.io/aipcc/base-images/cuda-stable:3.5.0-1780598175\n")
+
+    assert get_accelerator_version_for_directory(directory, "CUDA") is None
+
+
+def _check_all_accelerator_variants(
+    directory: pathlib.Path,
+    manifests_directory: pathlib.Path,
+    subtests: pytest.Subtests,
+) -> None:
+    """Check accelerator versions for all build-args variants (cuda, rocm) in a directory.
+
+    Some directories (e.g. jupyter/minimal) have both konflux.cuda.conf and
+    konflux.rocm.conf but extract_metadata_from_path only returns one accelerator
+    flavor, so the other manifest never gets validated by the main test loop.
+    """
+    for conf_file in sorted(directory.glob("build-args/konflux.*.conf")):
+        flavor = conf_file.stem.replace("konflux.", "")
+        if flavor not in ("cuda", "rocm"):
+            continue
+        accel_name = "CUDA" if flavor == "cuda" else "ROCm"
+        with subtests.test(msg=f"accelerator variant {flavor}", directory=str(directory)):
+            expected_version = get_accelerator_version_for_directory(directory, accel_name)
+            if expected_version is None:
+                pytest.skip(f"{accel_name} version is not encoded in stable BASE_IMAGE for {directory}")
+
+            try:
+                manifest = load_manifests_file_for(directory, manifests_directory, accelerator_flavor=flavor)
+            except FileNotFoundError:
+                pytest.skip(f"No manifest file for {directory} with {flavor}")
+
+            accel_entry = next((s for s in manifest.sw if s.get("name") == accel_name), None)
+            assert accel_entry is not None, f"{manifest.filename.name}: missing {accel_name} entry in notebook-software"
+            manifest_version = accel_entry.get("version", "").lstrip("v")
+            assert manifest_version == expected_version, (
+                f"{manifest.filename.name}: {accel_name} version in imagestream "
+                f"({accel_entry.get('version')}) does not match build-args version ({expected_version})"
+            )
 
 
 @dataclasses.dataclass
@@ -701,10 +1041,65 @@ class Manifest:
     dep: list[dict[str, Any]]
 
 
-def load_manifests_file_for(directory: pathlib.Path) -> Manifest:
+def _collect_rpms_lock_files() -> list[pathlib.Path]:
+    # RHDS only: ODH images are not subject to Conforma rpm_packages.unique_version policy (47517e5ca).
+    files = sorted(PROJECT_ROOT.glob("**/prefetch-input/rhds/rpms.lock.yaml"))
+    assert files, "No RHDS rpms.lock.yaml files found under PROJECT_ROOT"
+    return files
+
+
+_KNOWN_EVR_MISMATCHES: frozenset[str] = frozenset()
+
+
+@pytest.mark.parametrize("lockfile", _collect_rpms_lock_files(), ids=lambda p: str(p.relative_to(PROJECT_ROOT)))
+def test_rpms_lock_nvr_consistency_across_arches(subtests: pytest.Subtests, lockfile: pathlib.Path):
+    """Assert that every RPM name pinned in RHDS rpms.lock.yaml has the same EVR across all architectures.
+
+    This only validates lockfile-installed RPMs. Packages inherited from the base
+    image (e.g. openssl, python3) are not covered here; cross-arch consistency for
+    those is enforced by Conforma's rpm_packages.unique_version policy post-build.
+    See RHAIENG-5321.
+    """
+    data = yaml.safe_load(lockfile.read_text())
+    arches = data.get("arches", [])
+    if len(arches) <= 1:
+        pytest.skip("only one architecture present; nothing to cross-check")
+
+    packages_by_name: dict[str, dict[str, str]] = defaultdict(dict)
+    for arch_entry in arches:
+        arch = arch_entry["arch"]
+        for pkg in arch_entry["packages"]:
+            with subtests.test(msg=f"{pkg['name']} duplicate entry check", package=pkg["name"], arch=arch):
+                by_arch = packages_by_name[pkg["name"]]
+                assert arch not in by_arch, (
+                    f"Duplicate RPM entry for package {pkg['name']!r} in arch {arch!r} "
+                    f"within {lockfile.relative_to(PROJECT_ROOT)}"
+                )
+                by_arch[arch] = pkg["evr"]
+
+    for pkg_name, evr_by_arch in packages_by_name.items():
+        if len(evr_by_arch) <= 1:
+            continue
+        with subtests.test(msg=f"{pkg_name} EVR consistency", package=pkg_name):
+            evrs = set(evr_by_arch.values())
+            if pkg_name in _KNOWN_EVR_MISMATCHES and len(evrs) != 1:
+                pytest.xfail(f"Pre-existing EVR mismatch for {pkg_name!r}: {evr_by_arch}")
+            assert len(evrs) == 1, (
+                f"RPM {pkg_name!r} has mismatched EVR across architectures in "
+                f"{lockfile.relative_to(PROJECT_ROOT)}: {evr_by_arch}"
+            )
+
+
+def load_manifests_file_for(
+    directory: pathlib.Path,
+    manifests_directory: pathlib.Path,
+    accelerator_flavor: str | None = None,
+) -> Manifest:
     metadata = manifests.extract_metadata_from_path(directory)
+    if accelerator_flavor is not None:
+        metadata = dataclasses.replace(metadata, accelerator_flavor=accelerator_flavor)
     manifest_file = manifests.get_source_of_truth_filepath(
-        root_repo_directory=PROJECT_ROOT,
+        manifests_directory=manifests_directory,
         metadata=metadata,
     )
     if not manifest_file.is_file():
@@ -713,12 +1108,8 @@ def load_manifests_file_for(directory: pathlib.Path) -> Manifest:
             f"Computed filepath '{manifest_file}' does not exist."
         )
 
-    # BEWARE: rhds rstudio has imagestream bundled in the buildconfig yaml
-    if "buildconfig" in manifest_file.name:
-        # imagestream is the first document in the file
-        imagestream = next(yaml.safe_load_all(manifest_file.read_text()))
-    else:
-        imagestream = yaml.safe_load(manifest_file.read_text())
+    # ``get_source_of_truth_filepath`` always points at a single-document ImageStream manifest.
+    imagestream = yaml.safe_load(manifest_file.read_text())
     recommended_tags = [
         tag
         for tag in imagestream["spec"]["tags"]
@@ -743,3 +1134,49 @@ def load_manifests_file_for(directory: pathlib.Path) -> Manifest:
         sw=sw,
         dep=dep,
     )
+
+
+@pytest.mark.parametrize(
+    "base_dir,expected_prefix",
+    [
+        (PROJECT_ROOT / "manifests" / "odh" / "base", "quay.io/opendatahub/"),
+        (PROJECT_ROOT / "manifests" / "rhoai" / "base", "registry.redhat.io/rhoai/"),
+    ],
+)
+def test_imagestream_imported_from_provenance(subtests: pytest.Subtests, base_dir: pathlib.Path, expected_prefix: str):
+    """Validate openshift.io/imported-from annotations against provenance drift (issue #3931)."""
+    bad_prefixes = ("quay.io/opendatahub/workbench-images", "quay.io/modh/")
+
+    for is_file in sorted(base_dir.glob("*-imagestream.yaml")):
+        is_data = yaml.safe_load(is_file.read_text())
+        is_name = is_data["metadata"]["name"]
+        tags = is_data["spec"]["tags"]
+
+        for tag in tags:
+            tag_name = tag["name"]
+            annotations = tag.get("annotations", {})
+            imported_from = annotations.get("openshift.io/imported-from")
+
+            with subtests.test(msg=f"imported-from present in {is_file.name} tag {tag_name}", imagestream=is_file.name, tag=tag_name):
+                assert imported_from, f"{is_file.name} tag {tag_name}: missing openshift.io/imported-from annotation"
+
+                for bad in bad_prefixes:
+                    assert not imported_from.startswith(bad), (
+                        f"{is_file.name} tag {tag_name}: openshift.io/imported-from {imported_from!r} "
+                        f"uses legacy/generic prefix {bad!r}"
+                    )
+
+                assert imported_from.startswith(expected_prefix), (
+                    f"{is_file.name} tag {tag_name}: openshift.io/imported-from {imported_from!r} "
+                    f"does not start with expected prefix {expected_prefix!r} for {base_dir.name}"
+                )
+
+                imported_basename = imported_from.split("/")[-1]
+                from_name = tag["from"]["name"]
+                normalized_imported_basename = imported_basename.replace("-rhel9", "-ubi9")
+                m_from = _PLACEHOLDER_RE.match(from_name)
+
+                assert m_from and m_from.group(1) == normalized_imported_basename, (
+                    f"{is_file.name} tag {tag_name}: openshift.io/imported-from basename {imported_basename!r} "
+                    f"(normalized: {normalized_imported_basename!r}) does not match from.name {from_name!r}"
+                )

@@ -5,43 +5,85 @@ name: Security
   push:
     branches:
       - main
+      - stable
+      - 'rhoai-*'
   pull_request:
+  schedule:
+    - cron: '0 5 * * 3'
   workflow_dispatch:
 jobs:
   build:
     name: Trivy scan (fs)
-    runs-on: ubuntu-24.04
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-26.04
     permissions:
       contents: read
       security-events: write
     steps:
 
-      # https://github.com/astral-sh/setup-uv
-      - name: Install the latest version of uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          version: "latest"
-          activate-environment: false
-          ignore-empty-workdir: true
-          enable-cache: false
-
       - name: Checkout code
-        uses: actions/checkout@v6
-
-      # Trivy does not support pylock.toml https://github.com/aquasecurity/trivy/discussions/9408
-      - run: find . -name pyproject.toml -execdir uv lock \;
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Trivy scan
-        uses: aquasecurity/trivy-action@b6643a29fecd7f34b3597bc6acb0a98b03d33ff8  # 0.33.1
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
         with:
+          version: 'v0.74.0'
           scan-type: 'fs'
+          trivy-config: trivy.yaml
           format: 'sarif'
           output: 'trivy-results.sarif'
-          severity: 'MEDIUM,HIGH,CRITICAL'
           exit-code: '0'
-          ignore-unfixed: false
 
       - name: Update Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
         with:
           sarif_file: 'trivy-results.sarif'
+
+  scheduled-scan:
+    name: Trivy scan (fs) [${{ matrix.ref }}]
+    # `schedule` only ever fires against the default branch, so a plain cron
+    # trigger would never re-scan the rhoai-* release branches once they go
+    # quiet. Sweep the active ones explicitly instead. Those branches only
+    # exist on the downstream repo, so skip this on forks/upstream.
+    if: github.event_name == 'schedule' && github.repository == 'red-hat-data-services/notebooks'
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [main, rhoai-3.5, rhoai-3.4, rhoai-3.3, rhoai-2.25]
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+
+      - name: Resolve checked-out commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25  # v0.36.0
+        with:
+          version: 'v0.74.0'
+          scan-type: 'fs'
+          trivy-config: trivy.yaml
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '0'
+
+      - name: Update Security tab
+        uses: github/codeql-action/upload-sarif@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          sarif_file: 'trivy-results.sarif'
+          # Required here (unlike the push/pull_request job above): matrix.ref
+          # points at a branch other than the one that triggered this run, so
+          # the commit info can't be inferred from github context.
+          ref: refs/heads/${{ matrix.ref }}
+          sha: ${{ steps.commit.outputs.sha }}

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import functools
 import logging
 import socket
 import subprocess
@@ -10,13 +9,11 @@ import time
 import traceback
 from typing import TYPE_CHECKING, Any, Literal, Self
 
-import kubernetes
 import kubernetes.client.api.core_v1_api
 import kubernetes.dynamic.exceptions
 import kubernetes.stream.ws_client
 import ocp_resources.deployment
 import ocp_resources.namespace
-import ocp_resources.persistent_volume_claim
 import ocp_resources.pod
 import ocp_resources.project_project_openshift_io
 import ocp_resources.project_request
@@ -42,7 +39,6 @@ class TestFrameConstants:
     READINESS_TIMEOUT = TIMEOUT_5MIN
 
 
-logging.basicConfig(level=logging.DEBUG)
 LOGGER = logging.getLogger(__name__)
 
 
@@ -51,24 +47,11 @@ LOGGER = logging.getLogger(__name__)
 
 def get_client() -> kubernetes.dynamic.DynamicClient:
     try:
-        # client = kubernetes.dynamic.DynamicClient(client=kubernetes.config.new_client_from_config())
-        # probably same as above
         client = ocp_resources.resource.get_client()
-        return client
-    except kubernetes.config.ConfigException as e:
-        # probably bad config
-        logging.error(e)
-    except kubernetes.dynamic.exceptions.UnauthorizedError as e:
-        # wrong or expired credentials
-        logging.error(e)
-    except kubernetes.client.ApiException as e:
-        # unexpected, we catch unauthorized above
-        logging.error(e)
+        return client  # pyright: ignore[reportReturnType]
     except Exception as e:
-        # unexpected error, assert here
         logging.error(e)
-
-    raise RuntimeError("Failed to instantiate client")
+        raise RuntimeError("Failed to instantiate client") from e
 
 
 def get_username(client: kubernetes.dynamic.DynamicClient) -> str:
@@ -106,7 +89,7 @@ class TestFrame[S]:
         return result
 
     def defer[T](self, obj: T, destructor: Callable[[T], None] | None = None) -> T:
-        self.stack.append((obj, destructor))
+        self.stack.append((obj, destructor))  # pyright: ignore[reportArgumentType]
         return obj
 
     def destroy(self, wait=False):
@@ -155,14 +138,6 @@ class ImageDeployment:
         ns = create_namespace(privileged_client=True, name=f"test-ns-{container_name}")
         self.tf.defer_resource(ns)
 
-        pvc = ocp_resources.persistent_volume_claim.PersistentVolumeClaim(
-            name=container_name,
-            namespace=ns.name,
-            accessmodes=ocp_resources.persistent_volume_claim.PersistentVolumeClaim.AccessMode.RWO,
-            volume_mode=ocp_resources.persistent_volume_claim.PersistentVolumeClaim.VolumeMode.FILE,
-            size="1Gi",
-        )
-        self.tf.defer_resource(pvc, wait=True)
         deployment = ocp_resources.deployment.Deployment(
             client=self.client,
             name=container_name,
@@ -182,7 +157,7 @@ class ImageDeployment:
                         #       level: 's0:c34,c4'
                         #     fsGroup: 1001130000
                         #     seccompProfile:
-                        #       type: RuntimeDefault
+                        #       profileType: RuntimeDefault
                         # ```
                         "openshift.io/scc": "restricted-v2"
                     },
@@ -225,18 +200,7 @@ class ImageDeployment:
                                 if accelerator
                                 else {}
                             ),
-                            # rstudio will not start without its volume mount and it does not log the error for it
-                            # See the testcontainers implementation of this (the tty=True part)
-                            "volumeMounts": [{"mountPath": "/opt/app-root/src", "name": "my-workbench"}],
                         },
-                    ],
-                    "volumes": [
-                        {
-                            "name": "my-workbench",
-                            "persistentVolumeClaim": {
-                                "claimName": container_name,
-                            },
-                        }
                     ],
                 },
             },
@@ -245,21 +209,21 @@ class ImageDeployment:
         LOGGER.debug("Waiting for pods to become ready...")
         PodUtils.wait_for_pods_ready(
             self.client,
-            namespace_name=ns.name,
+            namespace_name=ns.name,  # pyright: ignore[reportArgumentType]
             label_selector=f"app={container_name}",
             expect_pods_count=1,
             timeout=timeout,
         )
 
         core_v1_api = kubernetes.client.api.core_v1_api.CoreV1Api(api_client=self.client.client)
-        pod_name: kubernetes.client.models.v1_pod_list.V1PodList = core_v1_api.list_namespaced_pod(
+        pod_list: kubernetes.client.models.v1_pod_list.V1PodList = core_v1_api.list_namespaced_pod(
             namespace=ns.name, label_selector=f"app={container_name}"
         )
-        assert len(pod_name.items) == 1
-        self.pod: kubernetes.client.models.v1_pod.V1Pod = pod_name.items[0]
+        assert len(pod_list.items) == 1, f"Expected exactly one pod for app={container_name}, got {len(pod_list.items)}"
+        self.pod: kubernetes.client.models.v1_pod.V1Pod = pod_list.items[0]
 
         if not is_runtime_image:
-            p = socket_proxy.SocketProxy(lambda: exposing_contextmanager(core_v1_api, self.pod), "localhost", 0)
+            p = socket_proxy.SocketProxy(lambda: exposing_contextmanager(core_v1_api, self.pod), "localhost", 0)  # pyright: ignore[reportArgumentType]
             t = threading.Thread(target=p.listen_and_serve_until_canceled)
             t.start()
             self.tf.defer(t, lambda thread: thread.join())
@@ -267,13 +231,12 @@ class ImageDeployment:
 
             self.port = p.get_actual_port()
             LOGGER.debug(f"Listening on port {self.port}")
-            # Use 60s timeout for all architectures to handle slower SSL/TLS negotiation
-            # especially on s390x and other non-native architectures
+            # Use 120s timeout for slower cold starts (e.g. code-server on arm64).
             Wait.until(
                 "Connecting to pod succeeds",
                 1,
-                60,
-                lambda: requests.get(f"http://localhost:{self.port}").status_code == 200,
+                120,
+                lambda: requests.get(f"http://127.0.0.1:{self.port}/api", timeout=10).status_code == 200,
             )
             LOGGER.debug("Done setting up portforward")
 
@@ -316,12 +279,37 @@ class ImageDeployment:
         returncode = resp.returncode
         resp.close()
 
+        if returncode is None:
+            raise RuntimeError(f"Pod exec terminated without exit code for command: {command}")
         return subprocess.CompletedProcess(
             args=command, returncode=returncode, stdout="\n".join(stdout), stderr="\n".join(stderr)
         )
 
 
 class PodUtils:
+    @staticmethod
+    def log_readiness_diagnostics(
+        client: DynamicClient,
+        namespace_name: str,
+        label_selector: str,
+    ) -> None:
+        """Log the pod and event state when readiness polling times out."""
+        core_v1_api = kubernetes.client.api.core_v1_api.CoreV1Api(api_client=client.client)
+
+        try:
+            pods = core_v1_api.list_namespaced_pod(namespace=namespace_name, label_selector=label_selector)
+            for pod in pods.items:
+                LOGGER.error("Pod diagnostics for %s/%s: %s", namespace_name, pod.metadata.name, pod.to_dict())
+        except Exception:
+            LOGGER.exception("Failed to collect pod diagnostics for Namespace %s", namespace_name)
+
+        try:
+            events = core_v1_api.list_namespaced_event(namespace=namespace_name)
+            for event in events.items:
+                LOGGER.error("Kubernetes event for Namespace %s: %s", namespace_name, event.to_dict())
+        except Exception:
+            LOGGER.exception("Failed to collect Kubernetes events for Namespace %s", namespace_name)
+
     # consider using timeout_sampler
     @staticmethod
     def wait_for_pods_ready(
@@ -343,7 +331,7 @@ class PodUtils:
         )
 
         def ready() -> bool:
-            pods = resource.get(namespace=namespace_name, label_selector=label_selector).items
+            pods = resource.get(namespace=namespace_name, label_selector=label_selector).items  # pyright: ignore[reportCallIssue]
             if not pods and expect_pods_count == 0:
                 logging.debug("All expected Pods %s in Namespace %s are ready", label_selector, namespace_name)
                 return True
@@ -379,6 +367,7 @@ class PodUtils:
             poll_interval=TestFrameConstants.GLOBAL_POLL_INTERVAL_MEDIUM,
             timeout=timeout,
             ready=ready,
+            on_timeout=lambda: PodUtils.log_readiness_diagnostics(client, namespace_name, label_selector),
         )
 
 
@@ -417,6 +406,7 @@ class Wait:
         new_exception_appearance: int = 0
 
         stack_trace_error: str | None = None
+        last_exception: Exception | None = None
 
         while True:
             try:
@@ -426,6 +416,7 @@ class Wait:
             except SyntaxError:  # this actually won't happen, but it's good to keep in mind
                 raise  # quick exit in cases developer obviously screwed up
             except Exception as e:
+                last_exception = e
                 exception_message = str(e)
 
                 exception_count += 1
@@ -461,7 +452,7 @@ class Wait:
                     on_timeout()
                 wait_exception: WaitError = WaitError(f"Timeout after {timeout} s waiting for {description}")
                 logging.error(wait_exception)
-                raise wait_exception
+                raise wait_exception from last_exception
 
             sleep_time: float = min(poll_interval, time_left)
             time.sleep(sleep_time)
@@ -478,7 +469,7 @@ class Readiness:
 
         condition = ocp_resources.pod.Pod.Condition.READY
         status = ocp_resources.pod.Pod.Condition.Status.TRUE
-        for cond in pod.get("status", {}).get("conditions", []):
+        for cond in (pod.get("status") or {}).get("conditions", []):  # pyright: ignore[reportOptionalCall]
             if cond["type"] == condition and cond["status"].casefold() == status.casefold():
                 return True
         return False
@@ -496,23 +487,83 @@ class Utils:
             raise ValueError(message)
 
 
+def _portforward_with_timeout(
+    core_v1_api: kubernetes.client.CoreV1Api, pod: kubernetes.client.models.V1Pod, timeout: float
+) -> kubernetes.stream.ws_client.PortForward:
+    """Runs kubernetes.stream.portforward() with a wall-clock bound.
+
+    The kubernetes client doesn't expose a per-call connect timeout for portforward() -- it calls
+    websocket.connect() with no timeout, so a wedged connection to the API server can hang this call
+    forever. The only alternative the library offers is a process-wide `websocket.setdefaulttimeout()`,
+    which isn't safe to use here since multiple SocketProxy instances (one per ImageDeployment) can be
+    making concurrent portforward() calls from different threads. So we run the call in a helper thread
+    and bound it with join(timeout) instead.
+
+    If the call doesn't return in time, it is abandoned rather than joined: the daemon thread and any
+    partially established connection are leaked for the remainder of the test process. That's an
+    accepted tradeoff for test infrastructure that's about to raise TimeoutError and fail the test
+    (and the process will exit soon after) rather than hang forever with no recovery.
+    """
+    pf_result: list[kubernetes.stream.ws_client.PortForward] = []
+    error_result: list[Exception] = []
+
+    def _target() -> None:
+        try:
+            pf = kubernetes.stream.portforward(
+                api_method=core_v1_api.connect_get_namespaced_pod_portforward,
+                name=pod.metadata.name,
+                namespace=pod.metadata.namespace,
+                ports=",".join(str(p) for p in [8888]),
+            )
+            pf_result.append(pf)
+        except Exception as e:  # propagated to the caller below, not swallowed
+            error_result.append(e)
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if error_result:
+        raise error_result[0]
+    if not pf_result:
+        raise TimeoutError(
+            f"kubernetes.stream.portforward() to {pod.metadata.name} did not return within {timeout:.1f}s"
+        )
+    return pf_result[0]
+
+
 @contextlib.contextmanager
 def exposing_contextmanager(
-    core_v1_api: kubernetes.client.CoreV1Api, pod: kubernetes.client.models.V1Pod
+    core_v1_api: kubernetes.client.CoreV1Api,
+    pod: kubernetes.client.models.V1Pod,
+    timeout: float = 30,
 ) -> Generator[socket]:
     # If we e.g., specify the wrong port, the pf = portforward() call succeeds,
     # but pf.connected will later flip to False
     # we need to check that _everything_ works before moving on
-    pf = None
+    #
+    # https://github.com/red-hat-data-services/notebooks/issues/2684: bound this retry loop (and each
+    # individual portforward() attempt via _portforward_with_timeout, since a single hung call would
+    # otherwise never let this loop's own deadline check run again) so a pod that never becomes
+    # reachable can't block the single-threaded SocketProxy forever and starve every later
+    # Wait.until retry.
+    deadline = time.monotonic() + timeout
+    pf: kubernetes.stream.ws_client.PortForward | None = None
     s = None
     while not pf or not pf.connected or not s:
-        pf: kubernetes.stream.ws_client.PortForward = kubernetes.stream.portforward(
-            api_method=core_v1_api.connect_get_namespaced_pod_portforward,
-            name=pod.metadata.name,
-            namespace=pod.metadata.namespace,
-            ports=",".join(str(p) for p in [8888]),
-        )
-        s: kubernetes.stream.ws_client.PortForward._Port._Socket | socket.socket | None = pf.socket(8888)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if s is not None:
+                s.close()
+            if pf is not None:
+                pf.close()
+            raise TimeoutError(f"Failed to establish a working portforward to {pod.metadata.name} within {timeout}s")
+        if s is not None:
+            s.close()
+            s = None
+        if pf is not None:
+            pf.close()
+        pf = _portforward_with_timeout(core_v1_api, pod, remaining)
+        s = pf.socket(8888)
     assert s, "Failed to establish connection"
 
     try:
@@ -522,7 +573,6 @@ def exposing_contextmanager(
         pf.close()
 
 
-@functools.wraps(ocp_resources.namespace.Namespace.__init__)
 def create_namespace(
     privileged_client: bool = False, *args, **kwargs
 ) -> ocp_resources.project_project_openshift_io.Project:

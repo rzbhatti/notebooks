@@ -19,7 +19,7 @@ set -euo pipefail
 
 # --- Configuration & Defaults ---
 SCRIPTS_PATH="scripts/lockfile-generators"
-UBI9_IMAGE="registry.redhat.io/ubi9:9.6"
+UBI9_IMAGE="registry.redhat.io/ubi9:9.8"
 ODH_BASE_IMAGE="quay.io/opendatahub/odh-base-image-cpu-py312-c9s:latest"
 
 RPM_INPUT=""
@@ -86,6 +86,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Fall back to env vars when CLI args are not provided (GHA passes secrets
+# this way so they never appear in shell command traces).
+ACTIVATION_KEY="${ACTIVATION_KEY:-${SUBSCRIPTION_ACTIVATION_KEY:-}}"
+ORG="${ORG:-${SUBSCRIPTION_ORG:-}}"
+
 # --- Required argument check ---
 [[ -z "$RPM_INPUT" ]] && error_exit "--rpm-input is required. E.g. --rpm-input codeserver/ubi9-python-3.12/prefetch-input/odh/rpms.in.yaml"
 [[ -f "$RPM_INPUT" ]] || error_exit "rpms.in.yaml not found at: $RPM_INPUT"
@@ -97,32 +102,48 @@ PREFETCH_DIR="$(dirname "$RPM_INPUT")"
 # With activation key + org: use UBI9 and pin release. Otherwise: use ODH base image (CentOS Stream), no releasever.
 if [[ -n "$ACTIVATION_KEY" ]] && [[ -n "$ORG" ]]; then
   BASE_IMAGE="$UBI9_IMAGE"
-  RHEL_VERSION="9.6"
+  RHEL_VERSION="9.8"
 else
   BASE_IMAGE="$ODH_BASE_IMAGE"
   RHEL_VERSION=""
 fi
 
 # First build the image, so we can run rpm-lockfile-prototype inside it
-echo "--- Building Lockfile Generator Image ---"
-podman build \
-    -f "$SCRIPTS_PATH/Dockerfile.rpm-lockfile" \
-    --platform linux/x86_64 \
-    --build-arg RHEL_VERSION="$RHEL_VERSION" \
-    --build-arg BASE_IMAGE="$BASE_IMAGE" \
-    --build-arg ACTIVATION_KEY="$ACTIVATION_KEY" \
-    --build-arg ORG="$ORG" \
-    -t notebook-rpm-lockfile "$SCRIPTS_PATH"
+CACHE_ARGS=()
+if [[ -n "${CONTAINER_BUILD_CACHE_ARGS:-}" ]]; then
+  # shellcheck disable=SC2206
+  CACHE_ARGS=($CONTAINER_BUILD_CACHE_ARGS)
+fi
+
+if podman image exists localhost/notebook-rpm-lockfile:latest 2>/dev/null; then
+  echo "--- Reusing existing Lockfile Generator Image ---"
+else
+  echo "--- Building Lockfile Generator Image ---"
+  # CACHE_ARGS may be empty; with set -u, bare "${CACHE_ARGS[@]}" errors.
+  # "${arr[@]}" is unbound under bash 3.2 + set -u when empty (macOS /bin/bash).
+  podman build \
+      -f "$SCRIPTS_PATH/Dockerfile.rpm-lockfile" \
+      --platform=linux/x86_64 \
+      --build-arg RHEL_VERSION="$RHEL_VERSION" \
+      --build-arg BASE_IMAGE="$BASE_IMAGE" \
+      --build-arg ACTIVATION_KEY="$ACTIVATION_KEY" \
+      --build-arg ORG="$ORG" \
+      ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
+      -t notebook-rpm-lockfile "$SCRIPTS_PATH"
+fi
 
 # Second run rpm-lockfile-prototype to generate the lockfile
+CONTAINER_WORKDIR="/workspace/$SCRIPTS_PATH"
 echo "--- Generating Lockfile using rpm-lockfile-prototype --"
-TTY_FLAG=""
-[ -t 1 ] && TTY_FLAG="-t"
-podman run --rm -i $TTY_FLAG \
+podman_run_args=(--rm -i)
+[[ -t 1 ]] && podman_run_args+=(-t)
+podman run "${podman_run_args[@]}" \
     -v "$(pwd):/workspace" \
-    --platform linux/x86_64 \
+    --platform=linux/x86_64 \
+    -w "$CONTAINER_WORKDIR" \
+    -e PREFETCH_INPUT_DIR="$PREFETCH_DIR" \
     localhost/notebook-rpm-lockfile:latest \
-    sh -c "cd /workspace/$SCRIPTS_PATH && ./helpers/rpm-lockfile-generate.sh prefetch-input=$PREFETCH_DIR"
+    ./helpers/rpm-lockfile-generate.sh
 
 # Download RPMs and create repository metadata (for dnf)
 if [[ "$DO_DOWNLOAD" == true ]]; then

@@ -14,6 +14,7 @@ We could also support files, or maybe even `### BEGIN funcname("param1", "param2
 
 from __future__ import annotations
 
+import re
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -24,14 +25,47 @@ if TYPE_CHECKING:
 
     from pyfakefs.fake_filesystem import FakeFilesystem
 
+UV_VERSION_PREFIX = "UV version"
+UV_REQUIREMENT_RE = re.compile(r"^uv==([^\\\s;]+)")
+REQUIREMENTS_CPU = "requirements.cpu.txt"
+
 # restricting to the relevant directories significantly speeds up the processing
 docker_directories = (
     ntb.ROOT_DIR / "base-images",
     ntb.ROOT_DIR / "jupyter",
     ntb.ROOT_DIR / "codeserver",
-    ntb.ROOT_DIR / "rstudio",
+    ntb.ROOT_DIR / "codeserver-baseline",
     ntb.ROOT_DIR / "runtimes",
 )
+
+
+def uv_version_from_requirements(requirements: pathlib.Path) -> str:
+    """Return the pinned ``uv`` version from a hashed requirements file."""
+    versions: set[str] = set()
+    with open(requirements, "rt") as fp:
+        for line in fp:
+            match = UV_REQUIREMENT_RE.match(line.strip())
+            if match:
+                versions.add(match.group(1))
+    if not versions:
+        raise ValueError(f"No uv== pin found in {requirements}")
+    if len(versions) > 1:
+        raise ValueError(f"Conflicting uv pins in {requirements}: {sorted(versions)}")
+    return next(iter(versions))
+
+
+def uv_version_replacement(dockerfile: pathlib.Path) -> dict[str, str]:
+    """Fill ``ARG UV_VERSION`` from the Dockerfile's sibling ``requirements.cpu.txt``."""
+    begin = f"### BEGIN {UV_VERSION_PREFIX}"
+    with open(dockerfile, "rt") as fp:
+        has_marker = any(line.rstrip() == begin for line in fp)
+    if not has_marker:
+        return {}
+    requirements = dockerfile.parent / REQUIREMENTS_CPU
+    if not requirements.is_file():
+        raise ValueError(f"{dockerfile} has '{begin}' but {requirements} is missing")
+    version = uv_version_from_requirements(requirements)
+    return {UV_VERSION_PREFIX: f"ARG UV_VERSION={version}\n"}
 
 
 def sanity_check(dockerfile: pathlib.Path, replacements: dict[str, str]):
@@ -42,11 +76,10 @@ def sanity_check(dockerfile: pathlib.Path, replacements: dict[str, str]):
         for line_no, line in enumerate(fp, start=1):
             for prefix in (begin, end):
                 if line.rstrip().startswith(prefix):
-                    suffix = line[len(prefix) + 1:].rstrip()
+                    suffix = line[len(prefix) + 1 :].rstrip()
                     if suffix not in replacements:
                         raise ValueError(
-                            f"Expected replacement for '{prefix} {suffix}' "
-                            f"not found in {dockerfile}:{line_no}"
+                            f"Expected replacement for '{prefix} {suffix}' not found in {dockerfile}:{line_no}"
                         )
 
 
@@ -64,6 +97,8 @@ def main():
     replacements = {
         "AIPCC pip and uv config files": textwrap.dedent(r'''
             ARG INDEX_URL
+            ENV PIP_INDEX_URL=${INDEX_URL}
+            ENV UV_INDEX_URL=${INDEX_URL}
             COPY --chmod=664 --chown=1001:0 base-images/utils/pip.conf.in /opt/app-root/pip.conf
             COPY --chmod=664 --chown=1001:0 base-images/utils/uv.toml.in /opt/app-root/uv.toml
             RUN /bin/bash <<'EOF'
@@ -88,27 +123,28 @@ def main():
                 LANG=en_US.UTF-8 \
                 LC_ALL=en_US.UTF-8 \
                 PS1="(app-root) \w\$ "'''),
-        "RHAIENG-2189: this is AIPCC migration phase 1.5": textwrap.dedent(r"""
+        "PyPI pip and uv index": textwrap.dedent(r"""
             ENV PIP_INDEX_URL=https://pypi.org/simple
-            # UV_INDEX_URL is deprecated in favor of UV_DEFAULT_INDEX
             ENV UV_INDEX_URL=https://pypi.org/simple
-            # https://docs.astral.sh/uv/reference/environment/#uv_default_index
-            ENV UV_DEFAULT_INDEX=https://pypi.org/simple"""),
-
-        "Subscribe with subscription manager": textwrap.dedent(subscription_manager_register_refresh),
-        "upgrade first to avoid fixable vulnerabilities": textwrap.dedent(ntb.process_template_with_indents(rt"""
-            {subscription_manager_register_refresh}
-            # Problem: The operation would result in removing the following protected packages: systemd
-            #  (try to add '--allowerasing' to command line to replace conflicting packages or '--skip-broken' to skip uninstallable packages)
-            # Solution: --best --skip-broken does not work either, so use --nobest
+            ENV UV_DEFAULT_INDEX=https://pypi.org/simple
             RUN /bin/bash <<'EOF'
             set -Eeuxo pipefail
-            dnf -y upgrade --refresh --nobest --skip-broken --nodocs --noplugins --setopt=install_weak_deps=0 --setopt=keepcache=0
-            dnf clean all -y
-            EOF
+            if [ -f /opt/app-root/pip.conf ]; then
+              sed -i 's|^index-url = .*|index-url = https://pypi.org/simple|' /opt/app-root/pip.conf
+            fi
+            if [ -f /opt/app-root/uv.toml ]; then
+              sed -i 's|^index-url = .*|index-url = "https://pypi.org/simple"|' /opt/app-root/uv.toml
+            fi
+            EOF"""),
+        "Subscribe with subscription manager": textwrap.dedent(subscription_manager_register_refresh),
+        "upgrade first to avoid fixable vulnerabilities": textwrap.dedent(
+            ntb.process_template_with_indents(rt"""
+            {subscription_manager_register_refresh}
+            RUN --mount=type=bind,source=base-images/utils,target=/utils,ro \
+                /utils/dnf-helper.sh upgrade
 
-        """)),
-        "Install micropipenv and uv to deploy packages from requirements.txt": '''RUN pip install --no-cache-dir --extra-index-url https://pypi.org/simple -U "micropipenv[toml]==1.10.0" "uv==0.9.28"''',
+        """)
+        ),
         "Install the oc client": textwrap.dedent(r"""
             RUN /bin/bash <<'EOF'
             set -Eeuxo pipefail
@@ -121,20 +157,12 @@ def main():
         """),
         "Dependencies for PDF export": textwrap.dedent(r"""
             RUN ./utils/install_pdf_deps.sh
-            ENV PATH="/usr/local/texlive/bin/linux:/usr/local/pandoc/bin:$PATH"
         """),
-        "Download Elyra Bootstrapper": textwrap.dedent(r"""
-            RUN curl -fL https://raw.githubusercontent.com/opendatahub-io/elyra/refs/tags/v4.3.1/elyra/kfp/bootstrapper.py \
-                     -o ./utils/bootstrapper.py
-            # Prevent Elyra from re-installing the dependencies
-            ENV ELYRA_INSTALL_PACKAGES="false"
-        """),
-
         "mongocli-builder stage": textwrap.dedent(r"""
             ######################################################
             # mongocli-builder (build stage only, not published) #
             ######################################################
-            FROM registry.access.redhat.com/ubi9/go-toolset:latest AS mongocli-builder
+            FROM registry.access.redhat.com/ubi9/go-toolset:1.26.7-1789040808 AS mongocli-builder
 
             ARG MONGOCLI_VERSION=2.0.4
 
@@ -151,7 +179,7 @@ def main():
             ######################################################
             # mongocli-builder (build stage only, not published) #
             ######################################################
-            FROM registry.access.redhat.com/ubi9/go-toolset:latest AS mongocli-builder
+            FROM registry.access.redhat.com/ubi9/go-toolset:1.26.7-1789040808 AS mongocli-builder
 
             ARG MONGOCLI_VERSION=2.0.4
 
@@ -198,9 +226,10 @@ def main():
             if dockerfile.is_relative_to(ntb.ROOT_DIR / "examples"):
                 continue
 
-            sanity_check(dockerfile, replacements)
+            replacements_for_file = {**replacements, **uv_version_replacement(dockerfile)}
+            sanity_check(dockerfile, replacements_for_file)
 
-            for prefix, contents in replacements.items():
+            for prefix, contents in replacements_for_file.items():
                 ntb.blockinfile(
                     filename=dockerfile,
                     contents=contents,

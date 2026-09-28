@@ -23,53 +23,190 @@ Pull requests are the best way to propose changes to the notebooks repository:
 
 ### Some basic instructions to create a new notebook
 
-- Decide from which notebook you want to derive the new notebook
-- Create a proper filepath and naming to the corresponding folder
-- Add the minimum files you have to add:
-    - Pipfile with the additional packages
-    - Dockefile with proper instructions
-    - Kustomization objects to deploy the new notebook into an openshift cluster (Kustomization.yaml, service.yaml, statefulset.yaml)
-- Create instructions into Makefile, for example if you derive the new notebooks from minimal then the recipe should be like the following:
+Each notebook image is a self-contained multi-stage Dockerfile — there are no inter-image
+dependencies. To add a new notebook:
+
+- Copy an existing leaf Dockerfile that is closest to your new image (e.g. copy
+  `jupyter/trustyai/ubi9-python-3.12/Dockerfile.cpu` and add your new stage at the end)
+- Create a proper filepath: `jupyter/${NOTEBOOK_NAME}/ubi9-python-3.12/`
+- Add the minimum files:
+    - `pyproject.toml` with the additional Python packages
+    - `Dockerfile.cpu` (and/or `.cuda`, `.rocm`) with multi-stage build instructions
+    - `build-args/` directory with `cpu.conf`, `konflux.cpu.conf`, etc.
+- Add a Makefile target (no dependency on another notebook target):
+    ```makefile
+    .PHONY: jupyter-${NOTEBOOK_NAME}-ubi9-python-$(RELEASE_PYTHON_VERSION)
+    jupyter-${NOTEBOOK_NAME}-ubi9-python-$(RELEASE_PYTHON_VERSION):
+    	$(call image,$@,jupyter/${NOTEBOOK_NAME}/ubi9-python-$(RELEASE_PYTHON_VERSION)/Dockerfile.cpu)
     ```
-    # Your comment here
-    .PHONY: jupyter-${NOTEBOOK_NAME}-ubi8-python-3.8
-    jupyter-${NOTEBOOK_NAME}-ubi8-python-3.8: jupyter-minimal-ubi8-python-3.8
-	$(call image,$@,jupyter/${NOTEBOOK_NAME}/ubi8-python-3.8,$<)
-    ```
-- Add the paths of the new pipfiles under `refresh-pipfilelock-files`
-- Run the [piplock-renewal.yaml](https://github.com/opendatahub-io/notebooks/blob/main/.github/workflows/piplock-renewal.yaml) against your fork branch, check [here](https://github.com/opendatahub-io/notebooks/blob/main/README.md) for more info.
-- Test the changes locally, by manually running the `$ make jupyter-${NOTEBOOK_NAME}-ubi8-python-3.8` from the terminal.
+- Add the new image path under `refresh-lock-files`
+- Run `make refresh-lock-files` to generate lock files
+- Test locally: `make jupyter-${NOTEBOOK_NAME}-ubi9-python-3.12`
+
+### Go toolchain
+
+The project requires Go 1.26+ for building helper tools (`scripts/buildinputs`, `scripts/check-payload`).
+The Makefile sets `GOTOOLCHAIN=auto` so Go will auto-download the correct version if yours is older.
+
+If you're on **Fedora** and the auto-download fails with a `GOSUMDB=off` error, either:
+- Run `export GOSUMDB=sum.golang.org` before `make`, or
+- Install Go 1.26+ manually from https://go.dev/dl/
+
+### GitHub Actions
+
+All third-party actions must be pinned by full commit SHA with a version comment:
+
+```yaml
+uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+```
+
+After adding or modifying any `uses:` line in `.github/`, run:
+
+```bash
+# Install: brew install pinact (or: go install github.com/suzuki-shunsuke/pinact/v3/cmd/pinact@v3.9.0)
+GITHUB_TOKEN=$(gh auth token) pinact run
+```
+
+CI enforces this via `pinact run --check --verify` in the code-quality workflow.
+See [ADR 0008](docs/architecture/decisions/0008-harden-github-actions-pin-sha-digests.md) for background.
+
+### Contributing from branches vs forks
+
+**Recommended:** If you have write access to the repo, push your branch directly
+and create the PR from there. If you started from a fork, add the upstream remote
+first so the branch lands in `opendatahub-io/notebooks` (not your fork):
+
+```bash
+git remote add upstream https://github.com/opendatahub-io/notebooks.git
+git push upstream HEAD:<your-initials>/branch-name
+```
+
+This gives CI full access to build secrets (RHEL subscription, AIPCC registry) and
+uses the org's paid runners with higher concurrency limits.
+
+**Fork PRs:** If you open a PR from a fork, CI will run non-secret checks (code
+quality, ODH image builds) but subscription builds (RHEL, AIPCC) will be skipped.
+A bot will comment with instructions for re-creating the PR from a same-repo branch.
 
 ### Working with linters
 
-- Run pre-commit before you commit, to lint the Python sources that have been put under its management
+- Run prek before you commit, to lint the Python sources that have been put under its management
+    ```console
+    uvx prek run --all-files
     ```
-    uv run pre-commit run --all-files
-    ```
-- If you like, you can install pre-commit to run automatically using `uv run pre-commit install`, as per its [install instructions](https://pre-commit.com/#3-install-the-git-hook-scripts)
+- If you like, you can install prek to run automatically using `uvx prek install -f`, as per its [install instructions](https://prek.j178.dev/quickstart)
 
-### Some basic instructions how to apply the new tests into [openshift-ci](https://github.com/openshift/release)
+`uvx prek install -f` installs both the normal pre-commit hook and the
+commit-message hook used to guard submodule references. Contributors who
+already installed the hooks should run the command again after pulling this
+change. The guard checks staged submodule pointers during local commits and
+checks every commit in a pull request in CI. An intentional pointer update
+should include `[submodule-update]` anywhere in its commit message; matching is
+case-insensitive. `ALLOW_SUBMODULE_CHANGE=1` is a local-only escape hatch for a
+single commit and has no effect in CI.
 
-- Fork the [openshift-ci](https://github.com/openshift/release) repo and create your branch from master.
-  - Definition and configuration of jobs used by this repository is on these places:
-    - [jobs](https://github.com/openshift/release/tree/master/ci-operator/jobs/opendatahub-io/notebooks)
-    - [config](https://github.com/openshift/release/tree/master/ci-operator/config/opendatahub-io/notebooks)
-- Issue a pull request there by adding the following.
-- Get navigated into [opendatahub-io-notebooks-main.yaml](https://github.com/openshift/release/blob/master/ci-operator/config/opendatahub-io/notebooks/opendatahub-io-notebooks-main.yaml) file.
-  - Under `images` option, add build instructions (directory path, from(parent image) and to(new notebook name))
-  - Under `tests` option, add the tests (*notebook-jupyter-${NOTEBOOK_NAME}-ubi8-python-3-8-image-mirror* and *notebook-jupyter-${NOTEBOOK_NAME}-ubi8-python-3-8-pr-image-mirror*)
-  - Under `notebooks-e2e-tests` add the *jupyter-${NOTEBOOK_NAME}-ubi8-python-3.8-test-e2e*
-  - Finally, run on terminal `$make jobs` and ensure that there are not errors.
-- Commit your PR
+Switching branches can leave a submodule worktree at a revision from the old
+branch. That working-tree state is separate from a staged or committed pointer:
+the guard only blocks the latter. To inspect an accidental staged pointer,
+unstage it with `git restore --staged -- <submodule-path>` and synchronize the
+worktree with `git submodule update --init --recursive`. Review the resulting
+status before staging anything again; avoid resetting or deleting work you have
+not verified.
 
+#### Running local Trivy security scans
+
+To run a local Trivy filesystem vulnerability scan using the repository's `trivy.yaml` configuration:
+
+```bash
+make trivy-scan
+```
+
+### CI configuration for a new notebook
+
+Each notebook image is built as an independent Konflux component with its own Tekton
+PipelineRun in `.tekton/`. To add CI for a new notebook, create a PipelineRun YAML
+following the pattern of existing ones in `.tekton/`. See the `.tekton/README-odh.md`
+for details.
 
 ### Testing your PR locally
 
-- Test the changes locally, by manually running the `$make jupyter-${NOTEBOOK_NAME}-ubi8-python-3.8` from the terminal. This definitely helps in that initial phase.
+For the full test catalog (types, markers, CI parity, and a package upgrade
+checklist), see [docs/agents/testing.md](docs/agents/testing.md).
+
+#### Environment setup
+
+- Use `uv` for local development:
+  ```bash
+  uv venv --python "$(which python3.14)"
+  uv sync --locked
+  ```
+- On macOS, install Homebrew GNU Make 4.x and put `gnubin` on `PATH` so `make`
+  resolves to the same binary used on Linux:
+  ```bash
+  brew install make
+  PATH="/opt/homebrew/opt/make/libexec/gnubin:$PATH"
+  ```
+- After dependency changes, regenerate locks with `make refresh-lock-files`.
+
+#### Common local commands
+
+```bash
+make test
+make test-unit
+make test-integration PYTEST_ARGS="--image=<image>"
+make jupyter-${NOTEBOOK_NAME}-ubi9-python-3.12
+make test-${NOTEBOOK_NAME}
+```
+
+#### Local gotchas
+
+- Run tests from a checkout whose directory name is exactly `notebooks`.
+  Hyphenated worktree paths such as `/tmp/pr-2293-ci` break
+  `test_image_pyprojects_version_alignment`.
+- If static tests fail in a surprising way, retry from a clean clone first. Extra
+  top-level files and directories such as `.cursor-tmp-*` can interfere with repo-wide
+  assertions.
+- For filesystem-heavy unit tests, prefer the `pyfakefs` `fs` fixture over `tmp_path`.
+- When renaming image labels or similar CI metadata, update only the current `-n`
+  entries in `ci/check-params-env.sh` and `ci/expected-image-metadata.yaml`. Historical
+  entries intentionally keep old names.
+- **macOS python.org SSL certificates:** If your default `python3` is the python.org
+  framework build (e.g. `/Library/Frameworks/Python.framework/...`), ad-hoc scripts that
+  use `urllib` or `requests` may fail with
+  `ssl.SSLCertVerificationError: certificate verify failed`. This is because the
+  python.org installer does not wire up CA certificates automatically. Fix once by
+  running:
+  ```bash
+  "/Applications/Python 3.12/Install Certificates.command"
+  ```
+  (adjust the version number to match your install). Alternatively, use the
+  `uv`-managed Python (`python3.14`) which uses the system trust store.
+
+#### ODH vs RHOAI local builds
+
+`PRODUCT` selects the product variant, not whether the build runs on Konflux/Tekton.
+Both variants are built on Konflux in CI; the variable changes which `build-args/*.conf`
+and manifest tree the Makefile uses locally.
+
+| `PRODUCT` value | Product variant | Build args | Manifests |
+|-----------------|-----------------|------------|-----------|
+| unset or `odh` | ODH (midstream default) | `build-args/<variant>.conf` | `manifests/odh/` |
+| `rhoai` | RHOAI downstream | `build-args/konflux.<variant>.conf` | `manifests/rhoai/` |
+
+Keep the same `PRODUCT` value for both the build step and the matching `make test-*`
+step so the imagestream manifests and expected package versions line up.
+
+For deeper references:
+
+- Konflux and Tekton details: [`docs/konflux.md`](docs/konflux.md)
+- Subscribed/AIPCC local builds: [`docs/subscribed-builds.md`](docs/subscribed-builds.md)
+- Hermetic build internals: [`docs/hermetic-guide.md`](docs/hermetic-guide.md)
+- CI failure ownership and systems: [`docs/ci.md`](docs/ci.md)
+- CVE-driven lockfile work: [`docs/cves/python.md`](docs/cves/python.md) and [`docs/cves/nodejs.md`](docs/cves/nodejs.md)
 
 ### Working with RHDS and ODH Repositories
 
-When contributing to notebook-related changes in the Red Hat Data Science (RHDS) ecosystem, it's important to understand the repository structure and contribution workflow:
+When contributing to notebook-related changes in the Red Hat Data Services (RHDS) ecosystem, it's important to understand the repository structure and contribution workflow:
 
 #### Repository Responsibilities
 
@@ -82,6 +219,10 @@ When contributing to notebook-related changes in the Red Hat Data Science (RHDS)
 - **Limited Changes**: Only `Dockerfile.konflux` files should be modified directly in this repository. Changes to these files flow to RHOAI upcoming release
 - **Konflux Integration**: This repository contains Konflux-specific build configurations and pipeline definitions
 - **Automated Sync**: Receives updates from the ODH notebooks repository automatically
+
+In this terminology, ODH is the **midstream** repo and RHOAI/RHDS is the **downstream**
+product repo. When shared files need one convention, follow the Konflux/RHOAI naming and
+behavior that the downstream automation expects.
 
 #### Contribution Workflow
 
@@ -96,8 +237,9 @@ When contributing to notebook-related changes in the Red Hat Data Science (RHDS)
    - Changes to these files flow to RHOAI upcoming release and need careful coordination
 
 3. **For Tekton Pipeline Changes**:
-   - Modify Tekton pipelines in the central repository as specified in the specific README documentation
-   - Follow the centralized pipeline management guidelines
+   - ODH `.tekton/` changes are made in this repository
+   - RHDS PR PipelineRun changes are authored in `konflux-central`, then synced into the downstream notebooks repo
+   - Follow the repository-specific Konflux documentation before editing pipeline definitions
 
 #### Best Practices
 
@@ -107,6 +249,20 @@ When contributing to notebook-related changes in the Red Hat Data Science (RHDS)
 - **Coordinate changes**: When making related changes across repositories, ensure consistency and proper sequencing
 
 This workflow ensures that the OpenDataHub community remains the primary development hub while maintaining compatibility with Red Hat's enterprise tooling and processes.
+
+### Debugging
+
+To debug tests, run pytest with verbose logging:
+
+```console
+uv run pytest -s --log-cli-level=DEBUG tests/
+```
+
+For container tests, add `--capture=fd` to see container output:
+
+```console
+uv run pytest --capture=fd tests/containers --image=<image> --log-cli-level=DEBUG
+```
 
 ### Review and Merge Process
 

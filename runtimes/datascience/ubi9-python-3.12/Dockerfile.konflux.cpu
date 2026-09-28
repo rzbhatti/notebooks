@@ -12,95 +12,35 @@ ARG TARGETARCH
 
 WORKDIR /opt/app-root/bin
 
-# OS Packages needs to be installed as root
+# hadolint ignore=DL3002
 USER 0
 
-ARG TARGETARCH
+# [HERMETIC] Import GPG keys for prefetched RPM verification.
+RUN rpm --import /cachi2/output/deps/generic/RPM-GPG-KEY-CentOS-Official || true
+RUN rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release
 
-### BEGIN upgrade first to avoid fixable vulnerabilities
-RUN /bin/bash <<'EOF'
-# If we have a Red Hat subscription prepared, refresh it
-set -Eeuxo pipefail
-if command -v subscription-manager &> /dev/null; then
-  subscription-manager identity &>/dev/null && subscription-manager refresh || echo "No identity, skipping refresh."
-fi
-EOF
+COPY prefetch-input/odh/rpms.lock.yaml /dev/null
+COPY prefetch-input/rhds/rpms.lock.yaml /dev/null
 
-# Problem: The operation would result in removing the following protected packages: systemd
-#  (try to add '--allowerasing' to command line to replace conflicting packages or '--skip-broken' to skip uninstallable packages)
-# Solution: --best --skip-broken does not work either, so use --nobest
+# hadolint ignore=DL3041
 RUN /bin/bash <<'EOF'
 set -Eeuxo pipefail
-dnf -y upgrade --refresh --nobest --skip-broken --nodocs --noplugins --setopt=install_weak_deps=0 --setopt=keepcache=0
-dnf clean all -y
+BASE_PKGS=(perl-interpreter mesa-libGL skopeo compat-openssl11 openshift-clients python3)
+if [ "$(uname -m)" = "s390x" ]; then
+    S390X_PKGS=(gcc gcc-c++ make openssl-devel autoconf automake libtool cmake python3-devel pybind11-devel openblas-devel)
+    # ODH and RHOAI use different base images here. Only request the s390x helper
+    # packages that are missing so we avoid upgrading an existing compiler/OpenMPI stack.
+    for pkg in "${S390X_PKGS[@]}"; do
+        rpm -q "${pkg}" >/dev/null 2>&1 || BASE_PKGS+=("${pkg}")
+    done
+fi
+dnf install -y "${BASE_PKGS[@]}"
+dnf clean all
+rm -rf /var/cache/yum
 EOF
 
-### END upgrade first to avoid fixable vulnerabilities
 
-# Install useful OS packages
-RUN --mount=type=cache,target=/var/cache/dnf /bin/bash <<'EOF'
-set -Eeuxo pipefail
-echo "Building for architecture: ${TARGETARCH}"
-PACKAGES=(perl mesa-libGL skopeo libxcrypt-compat)
-# Datascience packages devel dependencies
-if [ "$TARGETARCH" = "s390x" ] || [ "$TARGETARCH" = "ppc64le" ]; then
-    PACKAGES+=(
-    # required to compile pillow
-    zlib-devel libjpeg-turbo-devel
-    # optional pillow deps https://pillow.readthedocs.io/en/latest/installation/building-from-source.html#external-libraries
-    #libtiff-devel libwebp-devel openjpeg2-devel lcms2-devel freetype-devel
-    #libimagequant-devel harfbuzz-devel fribidi-devel
-
-    # required to compile maturin
-    openssl-devel
-
-    # required to compile scikit-learn
-    gcc-gfortran
-    )
-fi
-# Additional dev tools only for s390x
-if [ "$TARGETARCH" = "s390x" ]; then
-    PACKAGES+=("gcc" "gcc-c++" "make" "openssl-devel" "autoconf" "automake" "libtool" "cmake" "python3-devel" "pybind11-devel" "openblas-devel" "unixODBC-devel" "openssl" "zlib-devel")
-fi
-if [ "$TARGETARCH" = "ppc64le" ]; then
-    PACKAGES+=(git gcc-toolset-13 make wget unzip rust cargo unixODBC-devel cmake ninja-build)
-fi
-if [ -n "$PACKAGES" ]; then
-    echo "Installing: $PACKAGES"
-    dnf install -y "${PACKAGES[@]}"
-    dnf clean all
-    rm -rf /var/cache/yum
-fi
-EOF
-
-# Set python alternatives only for s390x (not needed for other arches)
-RUN /bin/bash <<'EOF'
-set -Eeuxo pipefail
-if [ "$TARGETARCH" = "s390x" ]; then
-    alternatives --install /usr/bin/python python /usr/bin/python3.12 1
-    alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
-    python --version && python3 --version
-fi
-EOF
-
-# Other apps and tools installed as default user
 USER 1001
-
-### BEGIN Install micropipenv and uv to deploy packages from requirements.txt
-RUN pip install --no-cache-dir --extra-index-url https://pypi.org/simple -U "micropipenv[toml]==1.10.0" "uv==0.9.28"
-### END Install micropipenv and uv to deploy packages from requirements.txt
-
-### BEGIN Install the oc client
-RUN /bin/bash <<'EOF'
-set -Eeuxo pipefail
-curl -L https://mirror.openshift.com/pub/openshift-v4/$(uname -m)/clients/ocp/stable/openshift-client-linux.tar.gz \
-    -o /tmp/openshift-client-linux.tar.gz
-tar -xzvf /tmp/openshift-client-linux.tar.gz oc
-rm -f /tmp/openshift-client-linux.tar.gz
-EOF
-
-### END Install the oc client
-
 
 #######################
 # runtime-datascience #
@@ -112,37 +52,36 @@ ARG DATASCIENCE_SOURCE_CODE=runtimes/datascience/ubi9-python-3.12
 ARG PYLOCK_FLAVOR
 
 WORKDIR /opt/app-root/bin
+
 USER 0
 
-# Install Python packages from pylock file
-COPY ${DATASCIENCE_SOURCE_CODE}/uv.lock.d/pylock.${PYLOCK_FLAVOR}.toml ./pylock.toml
-# Copy Elyra dependencies for air-gapped enviroment
-COPY --chown=1001 ${DATASCIENCE_SOURCE_CODE}/utils ./utils/
-### BEGIN Download Elyra Bootstrapper
-RUN curl -fL https://raw.githubusercontent.com/opendatahub-io/elyra/refs/tags/v4.3.1/elyra/kfp/bootstrapper.py \
-         -o ./utils/bootstrapper.py
-# Prevent Elyra from re-installing the dependencies
-ENV ELYRA_INSTALL_PACKAGES="false"
+COPY prefetch-input/odh/rpms.lock.yaml /dev/null
+COPY prefetch-input/rhds/rpms.lock.yaml /dev/null
 
-### END Download Elyra Bootstrapper
+RUN --mount=type=bind,source=base-images/utils,target=/utils,ro \
+    bash /utils/dnf-helper.sh install jq unixODBC postgresql git-lfs libsndfile libxcrypt-compat protobuf
+
+COPY --chown=1001:0 ${DATASCIENCE_SOURCE_CODE}/uv.lock.d/pylock.${PYLOCK_FLAVOR}.toml ./pylock.toml
+COPY --chown=1001:0 ${DATASCIENCE_SOURCE_CODE}/requirements.${PYLOCK_FLAVOR}.txt ./requirements.txt
+COPY --chown=1001:0 ${DATASCIENCE_SOURCE_CODE}/utils ./utils/
+
+COPY --chown=1001:0 prefetch-input/elyra-v4.3.1/elyra/kfp/bootstrapper.py /opt/app-root/bin/utils/bootstrapper.py
+
+ENV ELYRA_INSTALL_PACKAGES="false"
 
 RUN /bin/bash <<'EOF'
 set -Eeuxo pipefail
 
-### BEGIN Install software and packages
 echo "Installing software and packages"
-# Install Python packages from lockfile with hash verification
-# All dependencies are explicitly listed in pylock.toml (--no-deps)
-UV_NO_CACHE=true UV_LINK_MODE=copy UV_PREVIEW_FEATURES=pylock uv pip install \
+UV_NO_CACHE=true UV_LINK_MODE=copy UV_PREVIEW_FEATURES=pylock uv pip install --no-index \
     --strict --no-deps --no-config --no-progress \
-    --require-hashes --compile-bytecode --index-strategy=unsafe-best-match \
-    --requirements=./pylock.toml
-### END Install software and packages
+    --compile-bytecode --index-strategy=unsafe-best-match \
+    --no-verify-hashes \
+    --find-links /cachi2/output/deps/pip \
+    --requirements=./requirements.txt
 
-# change ownership to default user (all packages were installed as root and has root:root ownership
 chown -R 1001:0 /opt/app-root/
 chmod -R g=u /opt/app-root
-# Fix permissions to support pip in Openshift environments
 chmod -R g+w /opt/app-root/lib/python3.12/site-packages
 fix-permissions /opt/app-root -P
 EOF
@@ -151,10 +90,15 @@ USER 1001
 
 WORKDIR /opt/app-root/src
 
-LABEL name="rhoai/odh-pipeline-runtime-datascience-cpu-py312-rhel9" \
-      com.redhat.component="odh-pipeline-runtime-datascience-cpu-py312-rhel9" \
-      io.k8s.display-name="odh-pipeline-runtime-datascience-cpu-py312-rhel9" \
-      io.k8s.description="Runtime data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
-      description="Runtime data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
+ARG LABEL_REGISTRY_PREFIX
+ARG LABEL_COMPONENT
+ARG RELEASE
+
+LABEL name="${LABEL_REGISTRY_PREFIX}/${LABEL_COMPONENT}" \
+      com.redhat.component="${LABEL_COMPONENT}" \
+      io.k8s.display-name="${LABEL_COMPONENT}" \
       summary="Runtime data science notebook image for ODH notebooks" \
-      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf"
+      description="Runtime data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
+      io.k8s.description="Runtime data science notebook image with base Python 3.12 builder image based on UBI9 for ODH notebooks" \
+      com.redhat.license_terms="https://www.redhat.com/licenses/Red_Hat_Standard_EULA_20191108.pdf" \
+      version="${RELEASE}"

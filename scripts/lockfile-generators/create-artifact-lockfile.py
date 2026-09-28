@@ -24,12 +24,13 @@ Usage:
   python3 scripts/lockfile-generators/create-artifact-lockfile.py \\
       --artifact-input path/to/artifacts.in.yaml
 """
+
 import argparse
 import hashlib
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import yaml
 
@@ -61,9 +62,9 @@ def download_file(url: str, target_path: Path) -> None:
     try:
         subprocess.run(cmd, check=True)
     except FileNotFoundError:
-        raise RuntimeError("wget not found: please install wget")
+        raise RuntimeError("wget not found: please install wget") from None
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(f"wget failed for {url}: exit code {e.returncode}")
+        raise RuntimeError(f"wget failed for {url}: exit code {e.returncode}") from e
 
 
 def normalize_checksum(checksum: str) -> str:
@@ -81,7 +82,7 @@ def load_artifact_input(input_path: Path) -> list[Any]:
         with open(input_path, encoding="utf-8") as f:
             data = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        print(f"Failed to parse YAML input: {e}", file=sys.stderr)
+        print(f"Failed to parse YAML input {input_path!r}: {e}", file=sys.stderr)
         sys.exit(1)
     except OSError as e:
         print(f"Failed to read {input_path}: {e}", file=sys.stderr)
@@ -99,7 +100,7 @@ def load_artifact_input(input_path: Path) -> list[Any]:
     return items
 
 
-def process_artifact(item: dict[str, Any], seen_filenames: set[str]) -> Optional[dict[str, Any]]:
+def process_artifact(item: dict[str, Any], seen_filenames: set[str]) -> dict[str, Any] | None:
     """Process a single artifact item. Skips duplicate filenames."""
     url = item.get("url")
     if not url:
@@ -172,8 +173,7 @@ def main():
             artifacts.append(result)
 
     if not artifacts:
-        print("Error: No artifacts were processed.", file=sys.stderr)
-        sys.exit(1)
+        print("No artifacts to process; writing empty lockfile.")
 
     # Write lockfile
     lock_data = {
@@ -190,7 +190,8 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("---\n")
         yaml.dump(
-            lock_data, f,
+            lock_data,
+            f,
             Dumper=_IndentDumper,
             default_flow_style=False,
             sort_keys=False,

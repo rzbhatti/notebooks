@@ -1,0 +1,1782 @@
+#!/usr/bin/env python3
+
+"""Sync image-tree build args from ``versions_config.yml``.
+
+This flow validates the root config, scans managed image-tree ``build-args``
+files, rewrites managed ``BASE_IMAGE`` and ``RELEASE`` assignments plus the
+root ``Makefile`` release defaults, resolves newer RHDS ``channel: fast``
+releases to the highest already-published phase per target repository, uses
+``skopeo`` to select the latest build in the chosen release-and-phase family,
+and pins each resolved ``BASE_IMAGE`` to an immutable
+``repository:tag@sha256:…`` reference.
+"""
+
+from __future__ import annotations
+
+import argparse
+import difflib
+import json
+import logging
+import re
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CONFIG_PATH = ROOT_DIR / "versions_config.yml"
+MANAGED_ROOTS = ("jupyter", "runtimes", "codeserver", "codeserver-baseline")
+POLICY_SCHEMA = object()
+GPU_FLAVORS = {
+    "cuda": ("minimal", "pytorch", "pytorch-llmcompressor", "tensorflow"),
+    "rocm": ("minimal", "pytorch", "tensorflow"),
+}
+ACCELERATOR_DISPLAY_NAMES = {
+    "cuda": "CUDA",
+    "rocm": "ROCm",
+}
+GPU_FLAVOR_PATHS = {
+    "cuda": {
+        ("jupyter", "minimal"): "minimal",
+        ("jupyter", "pytorch"): "pytorch",
+        ("runtimes", "pytorch"): "pytorch",
+        ("jupyter", "pytorch+llmcompressor"): "pytorch-llmcompressor",
+        ("runtimes", "pytorch+llmcompressor"): "pytorch-llmcompressor",
+        ("jupyter", "tensorflow"): "tensorflow",
+        ("runtimes", "tensorflow"): "tensorflow",
+    },
+    "rocm": {
+        ("jupyter", "minimal"): "minimal",
+        ("jupyter", "rocm", "pytorch"): "pytorch",
+        ("runtimes", "rocm-pytorch"): "pytorch",
+        ("jupyter", "rocm", "tensorflow"): "tensorflow",
+        ("runtimes", "rocm-tensorflow"): "tensorflow",
+    },
+}
+CPU_BASE_IMAGE_SCHEMA = {
+    "rhds": POLICY_SCHEMA,
+    "odh": POLICY_SCHEMA,
+}
+BASELINE_CPU_BASE_IMAGE_SCHEMA = {
+    "odh": POLICY_SCHEMA,
+}
+logger = logging.getLogger(__name__)
+ANSI_GREEN = "\033[32m"
+ANSI_YELLOW = "\033[33m"
+ANSI_RED = "\033[31m"
+ANSI_RESET = "\033[0m"
+WARNING_COLORS = {
+    "green": ANSI_GREEN,
+    "yellow": ANSI_YELLOW,
+    "red": ANSI_RED,
+}
+CONF_ASSIGNMENT_RE = re.compile(r"^(?P<prefix>\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)=).*$")
+MAKEFILE_ASSIGNMENT_RE = re.compile(r"^(?P<prefix>\s*(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?:\s*\?=\s*)).*$")
+
+BASE_IMAGE_SCHEMA = {
+    "cpu": CPU_BASE_IMAGE_SCHEMA,
+    "baseline_cpu": BASELINE_CPU_BASE_IMAGE_SCHEMA,
+    "cuda": dict.fromkeys(GPU_FLAVORS["cuda"]),
+    "rocm": dict.fromkeys(GPU_FLAVORS["rocm"]),
+}
+
+ROOT_SCHEMA = {
+    "schema_version": None,
+    "release": {
+        "full_version": None,
+        "rhds_os_base": None,
+        "python_version": None,
+    },
+    "artifacts": {
+        "base_image": BASE_IMAGE_SCHEMA,
+    },
+}
+
+RHDS_CHANNELS = frozenset({"fast", "stable"})
+ODH_ORIGINS = frozenset({"in-house", "midstream"})
+RHDS_STABLE_OVERRIDE_ACCELERATORS = frozenset({"cuda", "rocm"})
+RHDS_TAG_RE = re.compile(r"^(?P<version>\d+\.\d+\.\d+)(?:-(?P<phase>ea\.\d+))?-(?P<build>\d+)$")
+# Published stable GPU tags use either:
+#   <full_version>                 e.g. 3.5.0
+#   <full_version>-<build>         e.g. 3.5.0-1784563933
+# Legacy pre-3.5 stable repos also used:
+#   <full_version>-stable-<build>  e.g. 3.5.0-stable-1780598175
+RHDS_STABLE_TAG_RE = re.compile(
+    r"^(?P<version>\d+\.\d+\.\d+)(?:-(?:(?P<legacy_stable>stable)-)?(?P<build>\d+))?$",
+)
+RHEL_PYTHON_TAG_RE = re.compile(r"^(?P<os_stream>\d+\.\d+)-(?P<build>\d+)$")
+RHDS_GPU_STABLE_REPOSITORY_SUFFIX = "-stable"
+RHDS_GPU_STABLE_REPOSITORY_PREFIX = "quay.io/aipcc/base-images/"
+MIDSTREAM_VERSION_RE = re.compile(r"^\d+\.\d+$")
+PYTHON_VERSION_RE = re.compile(r"^\d+\.\d+$")
+_STABLE_ACC_VERSION_INSPECT_FAILED = object()
+
+
+@dataclass(frozen=True)
+class ReleaseConfig:
+    full_version: str
+    rhds_os_base: str
+    python_version: str
+
+
+@dataclass(frozen=True)
+class BaseImagePolicy:
+    mode: str
+    version: str | None = None
+
+
+@dataclass(frozen=True)
+class VersionsConfig:
+    release: ReleaseConfig
+    base_image: dict[str, Any]
+    gpu_acc_versions: dict[tuple[str, str], str]
+
+    def policy(
+        self,
+        accelerator: str,
+        distribution: str,
+        flavor: str | None = None,
+        *,
+        baseline: bool = False,
+    ) -> BaseImagePolicy:
+        if baseline:
+            if accelerator != "cpu":
+                raise ValueError(f"Baseline policy supports CPU only, got accelerator '{accelerator}'")
+            raw_policy = self.base_image["baseline_cpu"][distribution]
+        elif accelerator == "cpu":
+            raw_policy = self.base_image["cpu"][distribution]
+        else:
+            if flavor is None:
+                raise ValueError(f"Flavor is required for accelerator '{accelerator}'")
+            raw_policy = self.base_image[accelerator][flavor][distribution]
+
+        key = "channel" if distribution == "rhds" else "origin"
+        mode = scalar_to_string(raw_policy[key])
+        version_key = policy_version_key(accelerator)
+        raw_version = raw_policy.get(version_key)
+        version = None if raw_version is None else resolve_version(raw_version, self.release)
+        return BaseImagePolicy(mode=mode, version=version)
+
+    def shared_acc_version(self, accelerator: str, flavor: str | None = None) -> str:
+        if accelerator == "cpu":
+            raise ValueError("CPU does not use acc_version")
+        if flavor is None:
+            raise ValueError(f"Flavor is required for accelerator '{accelerator}'")
+        return self.gpu_acc_versions[accelerator, flavor]
+
+
+@dataclass(frozen=True)
+class ConfTarget:
+    path: Path
+    accelerator: str
+    distribution: str
+    flavor: str | None
+    is_baseline: bool = False
+
+
+@dataclass(frozen=True)
+class PlannedUpdate:
+    path: Path
+    original_text: str
+    updated_text: str
+    target: ConfTarget | None = None
+
+
+@dataclass(frozen=True)
+class TargetState:
+    target: ConfTarget
+    original_text: str
+    current_base_image: str
+    policy: BaseImagePolicy
+    shared_acc_version: str | None = None
+
+
+@dataclass(frozen=True)
+class InspectedImageConfig:
+    env: dict[str, str]
+    labels: dict[str, str]
+    history: tuple[str, ...]
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> InspectedImageConfig:
+        config = payload.get("config")
+        raw_env = config.get("Env") if isinstance(config, dict) else None
+        raw_history = payload.get("history")
+
+        env: dict[str, str] = {}
+        if isinstance(raw_env, list):
+            for entry in raw_env:
+                if not isinstance(entry, str) or "=" not in entry:
+                    continue
+                key, value = entry.split("=", 1)
+                env[key] = value
+
+        labels: dict[str, str] = {}
+        for raw_labels in (
+            config.get("Labels") if isinstance(config, dict) else None,
+            payload.get("Labels"),
+        ):
+            if not isinstance(raw_labels, dict):
+                continue
+            labels.update(
+                {key: value for key, value in raw_labels.items() if isinstance(key, str) and isinstance(value, str)}
+            )
+
+        history: list[str] = []
+        if isinstance(raw_history, list):
+            for layer in raw_history:
+                if not isinstance(layer, dict):
+                    continue
+                created_by = layer.get("created_by")
+                if isinstance(created_by, str):
+                    history.append(created_by)
+
+        return cls(env=env, labels=labels, history=tuple(history))
+
+
+def scalar_to_string(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, int | float):
+        return str(value)
+    raise TypeError(f"Unsupported scalar value: {value!r}")
+
+
+def log_warning(message: str, *args: object, color: str | None = None) -> None:
+    if color is None:
+        logger.warning(message, *args)
+        return
+
+    rendered_message = message % args if args else message
+    ansi_color = WARNING_COLORS.get(color)
+    if ansi_color is None:
+        raise ValueError(f"Unsupported warning color '{color}'")
+    logger.warning(f"{ansi_color}WARNING: {rendered_message}{ANSI_RESET}")
+
+
+def policy_version_key(accelerator: str) -> str:
+    return "version" if accelerator == "cpu" else "acc_version"
+
+
+def resolve_version(value: object, release: ReleaseConfig) -> str:
+    resolved = scalar_to_string(value)
+    if resolved == "<full_version>":
+        return release.full_version
+    return resolved
+
+
+def parse_release_version(version: str) -> tuple[int, int, int]:
+    parts = version.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"Expected semantic version, got '{version}'")
+    try:
+        return tuple(int(part) for part in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise ValueError(f"Expected semantic version, got '{version}'") from exc
+
+
+def release_minor_version(full_version: str) -> str:
+    major, minor, _patch = parse_release_version(full_version)
+    return f"{major}.{minor}"
+
+
+def parse_minor_version(version: str) -> tuple[int, int]:
+    parts = version.split(".")
+    if len(parts) != 2:
+        raise ValueError(f"Expected major.minor version, got '{version}'")
+    try:
+        return tuple(int(part) for part in parts)  # type: ignore[return-value]
+    except ValueError as exc:
+        raise ValueError(f"Expected major.minor version, got '{version}'") from exc
+
+
+def normalize_python_version(version: str) -> str:
+    if PYTHON_VERSION_RE.fullmatch(version) is None:
+        raise ValueError(f"release.python_version must be in major.minor format, got '{version}'")
+    return version
+
+
+def compact_python_version(version: str) -> str:
+    return normalize_python_version(version).replace(".", "")
+
+
+def hyphenated_python_version(version: str) -> str:
+    return normalize_python_version(version).replace(".", "-")
+
+
+def validate_mapping_schema(data: object, expected: dict[str, Any], context: str) -> None:
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected mapping at {context}")
+
+    actual_keys = set(data)
+    expected_keys = set(expected)
+    unexpected_keys = sorted(actual_keys - expected_keys)
+    missing_keys = sorted(expected_keys - actual_keys)
+
+    if unexpected_keys:
+        raise ValueError(f"Unexpected keys under {context}: {', '.join(unexpected_keys)}")
+    if missing_keys:
+        raise ValueError(f"Missing keys under {context}: {', '.join(missing_keys)}")
+
+    for key, child_schema in expected.items():
+        if child_schema is POLICY_SCHEMA:
+            continue
+        if isinstance(child_schema, dict):
+            validate_mapping_schema(data[key], child_schema, f"{context}.{key}")
+
+
+def validate_expected_mapping_keys(
+    data: object,
+    expected_keys: set[str],
+    context: str,
+    *,
+    required_keys: set[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected mapping at {context}")
+
+    actual_keys = set(data)
+    unexpected_keys = sorted(actual_keys - expected_keys)
+    missing_keys = sorted((required_keys or expected_keys) - actual_keys)
+
+    if unexpected_keys:
+        raise ValueError(f"Unexpected keys under {context}: {', '.join(unexpected_keys)}")
+    if missing_keys:
+        raise ValueError(f"Missing keys under {context}: {', '.join(missing_keys)}")
+    return data
+
+
+def validate_version_value(value: object, release: ReleaseConfig, context: str, field_name: str) -> str:
+    try:
+        resolved = resolve_version(value, release)
+    except TypeError as exc:
+        raise ValueError(f"Invalid {field_name} at {context}: {exc}") from exc
+    if not resolved:
+        raise ValueError(f"{field_name} at {context} must not be empty")
+    return resolved
+
+
+def validate_distribution_policy(
+    policy: object,
+    *,
+    distribution: str,
+    accelerator: str,
+    context: str,
+    release: ReleaseConfig,
+) -> None:
+    if not isinstance(policy, dict):
+        raise ValueError(f"Expected mapping at {context}")
+
+    if distribution == "rhds":
+        version_key = policy_version_key(accelerator)
+        actual_keys = set(policy)
+        allowed_keys = {"channel", version_key}
+        unexpected_keys = sorted(actual_keys - allowed_keys)
+        if unexpected_keys:
+            raise ValueError(f"Unexpected keys under {context}: {', '.join(unexpected_keys)}")
+        if "channel" not in policy:
+            raise ValueError(f"Missing keys under {context}: channel")
+
+        channel = scalar_to_string(policy["channel"])
+        if channel not in RHDS_CHANNELS:
+            raise ValueError(f"Invalid rhds channel at {context}: {channel}")
+        if channel == "fast":
+            if version_key not in policy:
+                raise ValueError(f"Missing {version_key} for rhds fast channel at {context}")
+            validate_version_value(policy[version_key], release, f"{context}.{version_key}", version_key)
+        elif version_key in policy:
+            raise ValueError(f"rhds stable channel at {context} must not define {version_key}")
+        return
+
+    if distribution != "odh":
+        raise ValueError(f"Unsupported distribution at {context}: {distribution}")
+
+    version_key = policy_version_key(accelerator)
+    actual_keys = set(policy)
+    allowed_keys = {"origin", version_key}
+    unexpected_keys = sorted(actual_keys - allowed_keys)
+    if unexpected_keys:
+        raise ValueError(f"Unexpected keys under {context}: {', '.join(unexpected_keys)}")
+    if "origin" not in policy:
+        raise ValueError(f"Missing keys under {context}: origin")
+
+    origin = scalar_to_string(policy["origin"])
+    if origin not in ODH_ORIGINS:
+        raise ValueError(f"Invalid odh origin at {context}: {origin}")
+    if version_key not in policy:
+        raise ValueError(f"Missing {version_key} for odh {origin} origin at {context}")
+
+    version = validate_version_value(policy[version_key], release, f"{context}.{version_key}", version_key)
+    normalized_version = normalize_stream_version(version)
+    if accelerator == "cpu":
+        if version != "latest":
+            raise ValueError(f"cpu odh {origin} origin at {context} requires version latest")
+        return
+    if origin == "midstream" and MIDSTREAM_VERSION_RE.fullmatch(normalized_version) is None:
+        raise ValueError(f"odh midstream origin at {context} requires a numeric {version_key}")
+    if origin == "in-house" and accelerator != "cpu" and MIDSTREAM_VERSION_RE.fullmatch(normalized_version) is None:
+        raise ValueError(f"odh in-house origin at {context} requires a numeric acc_version")
+
+
+def normalize_gpu_flavor_config(
+    flavor_policy: object,
+    *,
+    accelerator: str,
+    flavor: str,
+    release: ReleaseConfig,
+) -> tuple[dict[str, Any], str]:
+    context = f"root.artifacts.base_image.{accelerator}.{flavor}"
+    mapping = validate_expected_mapping_keys(
+        flavor_policy, {"acc_version", "rhds", "odh"}, context, required_keys={"rhds", "odh"}
+    )
+
+    rhds_policy = mapping["rhds"]
+    odh_policy = mapping["odh"]
+
+    if not isinstance(rhds_policy, dict):
+        raise ValueError(f"Expected mapping at {context}.rhds")
+    if not isinstance(odh_policy, dict):
+        raise ValueError(f"Expected mapping at {context}.odh")
+
+    normalized_rhds = dict(rhds_policy)
+    normalized_odh = dict(odh_policy)
+    shared_raw = mapping.get("acc_version")
+
+    if shared_raw is None:
+        validate_distribution_policy(
+            normalized_rhds,
+            distribution="rhds",
+            accelerator=accelerator,
+            context=f"{context}.rhds",
+            release=release,
+        )
+        validate_distribution_policy(
+            normalized_odh,
+            distribution="odh",
+            accelerator=accelerator,
+            context=f"{context}.odh",
+            release=release,
+        )
+
+        shared_versions = [
+            validate_version_value(normalized_odh["acc_version"], release, f"{context}.odh.acc_version", "acc_version")
+        ]
+        if "acc_version" in normalized_rhds:
+            shared_versions.append(
+                validate_version_value(
+                    normalized_rhds["acc_version"], release, f"{context}.rhds.acc_version", "acc_version"
+                )
+            )
+
+        normalized_versions = {normalize_stream_version(version) for version in shared_versions}
+        if len(normalized_versions) != 1:
+            raise ValueError(f"Legacy rhds and odh acc_version values must match at {context}")
+        return {"rhds": normalized_rhds, "odh": normalized_odh}, shared_versions[0]
+
+    shared_version = validate_version_value(shared_raw, release, f"{context}.acc_version", "acc_version")
+    shared_version_normalized = normalize_stream_version(shared_version)
+
+    for distribution, policy in (("rhds", normalized_rhds), ("odh", normalized_odh)):
+        raw_distribution_version = policy.pop("acc_version", None)
+        if raw_distribution_version is None:
+            continue
+
+        distribution_version = validate_version_value(
+            raw_distribution_version,
+            release,
+            f"{context}.{distribution}.acc_version",
+            "acc_version",
+        )
+        if normalize_stream_version(distribution_version) != shared_version_normalized:
+            raise ValueError(
+                f"Nested {distribution} acc_version at {context}.{distribution} must match shared acc_version"
+            )
+
+    if scalar_to_string(normalized_rhds.get("channel", "")) == "fast":
+        normalized_rhds["acc_version"] = shared_version
+    normalized_odh["acc_version"] = shared_version
+
+    validate_distribution_policy(
+        normalized_rhds,
+        distribution="rhds",
+        accelerator=accelerator,
+        context=f"{context}.rhds",
+        release=release,
+    )
+    validate_distribution_policy(
+        normalized_odh,
+        distribution="odh",
+        accelerator=accelerator,
+        context=f"{context}.odh",
+        release=release,
+    )
+    return {"rhds": normalized_rhds, "odh": normalized_odh}, shared_version
+
+
+def normalize_base_image_config(
+    base_image: object,
+    release: ReleaseConfig,
+) -> tuple[dict[str, Any], dict[tuple[str, str], str]]:
+    root_context = "root.artifacts.base_image"
+    mapping = validate_expected_mapping_keys(base_image, set(BASE_IMAGE_SCHEMA), root_context)
+
+    validate_mapping_schema(mapping["cpu"], CPU_BASE_IMAGE_SCHEMA, f"{root_context}.cpu")
+    validate_mapping_schema(
+        mapping["baseline_cpu"],
+        BASELINE_CPU_BASE_IMAGE_SCHEMA,
+        f"{root_context}.baseline_cpu",
+    )
+
+    normalized_base_image = {
+        "cpu": mapping["cpu"],
+        "baseline_cpu": mapping["baseline_cpu"],
+        "cuda": {},
+        "rocm": {},
+    }
+    gpu_acc_versions: dict[tuple[str, str], str] = {}
+
+    for distribution in ("rhds", "odh"):
+        validate_distribution_policy(
+            mapping["cpu"][distribution],
+            distribution=distribution,
+            accelerator="cpu",
+            context=f"cpu.{distribution}",
+            release=release,
+        )
+
+    validate_distribution_policy(
+        mapping["baseline_cpu"]["odh"],
+        distribution="odh",
+        accelerator="cpu",
+        context="baseline_cpu.odh",
+        release=release,
+    )
+
+    for accelerator, flavors in GPU_FLAVORS.items():
+        accelerator_mapping = validate_expected_mapping_keys(
+            mapping[accelerator],
+            set(flavors),
+            f"{root_context}.{accelerator}",
+        )
+        for flavor in flavors:
+            normalized_flavor, shared_version = normalize_gpu_flavor_config(
+                accelerator_mapping[flavor],
+                accelerator=accelerator,
+                flavor=flavor,
+                release=release,
+            )
+            normalized_base_image[accelerator][flavor] = normalized_flavor
+            gpu_acc_versions[accelerator, flavor] = shared_version
+
+    return normalized_base_image, gpu_acc_versions
+
+
+def load_versions_config(path: Path) -> VersionsConfig:
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected top-level mapping in {path}")
+
+    validate_mapping_schema(data, ROOT_SCHEMA, "root")
+
+    if data["schema_version"] != 1:
+        raise ValueError(f"Unsupported schema_version in {path}: {data['schema_version']!r}")
+
+    release_data = data["release"]
+    release = ReleaseConfig(
+        full_version=scalar_to_string(release_data["full_version"]),
+        rhds_os_base=scalar_to_string(release_data["rhds_os_base"]),
+        python_version=scalar_to_string(release_data["python_version"]),
+    )
+    parse_release_version(release.full_version)
+    if not release.rhds_os_base:
+        raise ValueError("release.rhds_os_base must not be empty")
+    normalize_python_version(release.python_version)
+
+    base_image, gpu_acc_versions = normalize_base_image_config(data["artifacts"]["base_image"], release)
+    return VersionsConfig(release=release, base_image=base_image, gpu_acc_versions=gpu_acc_versions)
+
+
+def classify_conf_name(name: str) -> tuple[str, str] | None:
+    mapping = {
+        "cpu.conf": ("cpu", "odh"),
+        "cuda.conf": ("cuda", "odh"),
+        "rocm.conf": ("rocm", "odh"),
+        "konflux.cpu.conf": ("cpu", "rhds"),
+        "konflux.cuda.conf": ("cuda", "rhds"),
+        "konflux.rocm.conf": ("rocm", "rhds"),
+    }
+    return mapping.get(name)
+
+
+def is_baseline_conf_path(relative_path: Path) -> bool:
+    parts = relative_path.parts
+    if parts and parts[0] == "codeserver-baseline":
+        return True
+    return len(parts) >= 2 and parts[1] == "baseline"
+
+
+def classify_flavor(relative_path: Path, accelerator: str) -> str | None:
+    parts = relative_path.parts
+
+    if accelerator == "cpu":
+        if parts[0] in MANAGED_ROOTS:
+            return None
+        raise ValueError(f"Unsupported CPU build-args path: {relative_path}")
+
+    mapping = GPU_FLAVOR_PATHS.get(accelerator)
+    if mapping is None:
+        raise ValueError(f"Unsupported accelerator '{accelerator}'")
+
+    for prefix in (parts[:3], parts[:2]):
+        if flavor := mapping.get(prefix):
+            return flavor
+
+    raise ValueError(
+        f"Unsupported {ACCELERATOR_DISPLAY_NAMES.get(accelerator, accelerator)} build-args path: {relative_path}"
+    )
+
+
+def collect_conf_targets(root_dir: Path) -> list[ConfTarget]:
+    targets: list[ConfTarget] = []
+
+    for managed_root in MANAGED_ROOTS:
+        search_root = root_dir / managed_root
+        if not search_root.is_dir():
+            continue
+
+        for path in sorted(search_root.rglob("build-args/*.conf")):
+            relative_path = path.relative_to(root_dir)
+            classification = classify_conf_name(path.name)
+            if classification is None:
+                raise ValueError(f"Unsupported build-args filename: {relative_path}")
+
+            accelerator, distribution = classification
+            targets.append(
+                ConfTarget(
+                    path=path,
+                    accelerator=accelerator,
+                    distribution=distribution,
+                    flavor=classify_flavor(relative_path, accelerator),
+                    is_baseline=is_baseline_conf_path(relative_path),
+                )
+            )
+
+    return targets
+
+
+def image_reference_is_digest(ref: str) -> bool:
+    return ref.startswith("sha256:")
+
+
+def is_rhds_gpu_stable_repository(repository: str) -> bool:
+    return repository.startswith(RHDS_GPU_STABLE_REPOSITORY_PREFIX) and repository.endswith(
+        RHDS_GPU_STABLE_REPOSITORY_SUFFIX,
+    )
+
+
+def treat_as_rhds_stable_tag(image: str, tag: str) -> bool:
+    if RHDS_STABLE_TAG_RE.fullmatch(tag) is None:
+        return False
+    repository, _ref = split_image_ref(image)
+    if is_rhds_gpu_stable_repository(repository):
+        return True
+    return "-stable-" in tag
+
+
+def split_image_ref(image: str) -> tuple[str, str]:
+    if "@" in image:
+        repository, ref = image.rsplit("@", 1)
+        if not ref:
+            raise ValueError(f"Image reference is missing a digest: {image}")
+        if ":" in repository:
+            repository = repository.rsplit(":", 1)[0]
+        return repository, ref
+
+    name, separator, tag = image.rpartition(":")
+    if not separator:
+        raise ValueError(f"Image reference is missing a tag: {image}")
+    return name, tag
+
+
+def inspect_image_manifest(
+    image: str,
+    *,
+    warning_color: str | None = None,
+) -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            [
+                "skopeo",
+                "inspect",
+                "--retry-times",
+                "3",
+                "--override-arch",
+                "amd64",
+                "--override-os",
+                "linux",
+                f"docker://{image}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log_warning("Could not inspect image manifest for %s: %s", image, exc, color=warning_color)
+        return None
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+        log_warning("skopeo inspect failed for %s: %s", image, detail, color=warning_color)
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        log_warning("skopeo inspect returned invalid JSON for %s: %s", image, exc, color=warning_color)
+        return None
+
+    if not isinstance(payload, dict):
+        log_warning("skopeo inspect returned unexpected payload for %s", image, color=warning_color)
+        return None
+    return payload
+
+
+def rhds_tag_sort_key(tag: str) -> tuple[tuple[int, int, int], int, int] | tuple[int, str]:
+    match = RHDS_TAG_RE.fullmatch(tag)
+    if match is None:
+        return (0, tag)
+    return (
+        parse_release_version(match.group("version")),
+        rank_rhds_phase(match.group("phase")),
+        int(match.group("build")),
+    )
+
+
+def select_best_matching_tag(matches: list[str]) -> str:
+    rhds_matches = [tag for tag in matches if RHDS_TAG_RE.fullmatch(tag)]
+    candidates = rhds_matches if rhds_matches else matches
+    return max(candidates, key=rhds_tag_sort_key)
+
+
+def _matching_tags_from_digest_cache(
+    repository: str,
+    digest_ref: str,
+    digest_cache: dict[str, str] | None,
+) -> list[str]:
+    if digest_cache is None:
+        return []
+
+    prefix = f"{repository}:"
+    return [
+        tagged_image.removeprefix(prefix)
+        for tagged_image, cached_digest in digest_cache.items()
+        if cached_digest == digest_ref and tagged_image.startswith(prefix)
+    ]
+
+
+def resolve_tag_for_digest_reference(
+    image: str,
+    *,
+    source_tag_by_digest: dict[str, str] | None = None,
+    digest_cache: dict[str, str] | None = None,
+    digest_to_tag_by_repository: dict[str, dict[str, str]] | None = None,
+) -> str | None:
+    if source_tag_by_digest is not None and image in source_tag_by_digest:
+        return source_tag_by_digest[image]
+
+    repository, digest_ref = split_image_ref(image)
+
+    if digest_to_tag_by_repository is not None:
+        repo_index = digest_to_tag_by_repository.get(repository)
+        if repo_index is not None and digest_ref in repo_index:
+            selected = repo_index[digest_ref]
+            if source_tag_by_digest is not None:
+                source_tag_by_digest[image] = selected
+            return selected
+
+    cached_matches = _matching_tags_from_digest_cache(repository, digest_ref, digest_cache)
+    if cached_matches:
+        selected = select_best_matching_tag(cached_matches)
+        if source_tag_by_digest is not None:
+            source_tag_by_digest[image] = selected
+        if digest_to_tag_by_repository is not None:
+            digest_to_tag_by_repository.setdefault(repository, {})[digest_ref] = selected
+        return selected
+
+    return None
+
+
+def image_tag_from_reference(
+    image: str,
+    *,
+    source_tag_by_digest: dict[str, str] | None = None,
+    digest_cache: dict[str, str] | None = None,
+    digest_to_tag_by_repository: dict[str, dict[str, str]] | None = None,
+) -> str | None:
+    _repository, ref = split_image_ref(image)
+    if not image_reference_is_digest(ref):
+        return ref
+
+    return resolve_tag_for_digest_reference(
+        image,
+        source_tag_by_digest=source_tag_by_digest,
+        digest_cache=digest_cache,
+        digest_to_tag_by_repository=digest_to_tag_by_repository,
+    )
+
+
+def resolve_image_digest(
+    image: str,
+    digest_cache: dict[str, str] | None = None,
+    source_tag_by_digest: dict[str, str] | None = None,
+) -> str:
+    repository, ref = split_image_ref(image)
+    if image_reference_is_digest(ref):
+        return image if "@" in image else f"{repository}@{ref}"
+
+    if digest_cache is not None and image in digest_cache:
+        pinned = f"{repository}:{ref}@{digest_cache[image]}"
+        if source_tag_by_digest is not None:
+            source_tag_by_digest[pinned] = ref
+        return pinned
+
+    payload = inspect_image_manifest(image)
+    if payload is None:
+        raise ValueError(f"skopeo inspect failed while resolving digest for {image}")
+
+    digest = payload.get("Digest")
+    if not isinstance(digest, str) or not digest:
+        raise ValueError(f"skopeo inspect returned no digest for {image}")
+
+    if digest_cache is not None:
+        digest_cache[image] = digest
+    pinned = f"{repository}:{ref}@{digest}"
+    if source_tag_by_digest is not None:
+        source_tag_by_digest[pinned] = ref
+    return pinned
+
+
+def normalize_stream_version(version: str) -> str:
+    return version.removeprefix("v")
+
+
+def major_minor_stream_version(value: str) -> str | None:
+    match = re.search(r"(?P<major>\d+)\.(?P<minor>\d+)(?:\.\d+)?", value)
+    if match is None:
+        return None
+    return f"{match.group('major')}.{match.group('minor')}"
+
+
+def inspect_image_config(image: str, *, warning_color: str | None = None) -> dict[str, Any] | None:
+    try:
+        result = subprocess.run(
+            [
+                "skopeo",
+                "inspect",
+                "--retry-times",
+                "3",
+                "--override-arch",
+                "amd64",
+                "--override-os",
+                "linux",
+                "--config",
+                f"docker://{image}",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        log_warning("Could not inspect image config for %s: %s", image, exc, color=warning_color)
+        return None
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+        log_warning("skopeo inspect --config failed for %s: %s", image, detail, color=warning_color)
+        return None
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        log_warning("skopeo inspect --config returned invalid JSON for %s: %s", image, exc, color=warning_color)
+        return None
+
+    if not isinstance(payload, dict):
+        log_warning("skopeo inspect --config returned unexpected payload for %s", image, color=warning_color)
+        return None
+    return payload
+
+
+def inspect_rhds_stable_acc_version(image: str, accelerator: str) -> str | object | None:
+    config_payload = inspect_image_config(image, warning_color="red")
+    if config_payload is None:
+        return _STABLE_ACC_VERSION_INSPECT_FAILED
+
+    inspected = InspectedImageConfig.from_payload(config_payload)
+
+    def first_major_minor(values: tuple[str | None, ...]) -> str | None:
+        for value in values:
+            if value and (version := major_minor_stream_version(value)):
+                return version
+        return None
+
+    def version_from_history(pattern: str) -> str | None:
+        for line in inspected.history:
+            match = re.search(pattern, line)
+            if match and (version := major_minor_stream_version(match.group("version"))):
+                return version
+        return None
+
+    match accelerator:
+        case "cuda":
+            if version := first_major_minor((inspected.env.get("CUDA_VERSION"), inspected.labels.get("CUDA_VERSION"))):
+                return version
+            requirement = inspected.env.get("NVIDIA_REQUIRE_CUDA")
+            if requirement is not None:
+                match = re.search(r"cuda>=(?P<version>\d+\.\d+(?:\.\d+)?)", requirement)
+                if match and (version := major_minor_stream_version(match.group("version"))):
+                    return version
+            return version_from_history(r"\bCUDA_VERSION=(?P<version>\d+\.\d+(?:\.\d+)?)\b")
+        case "rocm":
+            if version := first_major_minor((inspected.env.get("ROCM_VERSION"), inspected.labels.get("ROCM_VERSION"))):
+                return version
+            return version_from_history(r"\bROCM_VERSION=(?P<version>\d+\.\d+(?:\.\d+)?)\b")
+        case _:
+            raise ValueError(f"Unsupported accelerator '{accelerator}'")
+
+
+def cached_rhds_stable_acc_version(
+    image: str,
+    accelerator: str,
+    stable_acc_version_cache: dict[tuple[str, str], str | object | None],
+) -> str | object | None:
+    cache_key = (image, accelerator)
+    if cache_key not in stable_acc_version_cache:
+        stable_acc_version_cache[cache_key] = inspect_rhds_stable_acc_version(image, accelerator)
+
+    detected_acc_version = stable_acc_version_cache[cache_key]
+    if detected_acc_version in (_STABLE_ACC_VERSION_INSPECT_FAILED, None):
+        return detected_acc_version
+    if not isinstance(detected_acc_version, str):
+        raise TypeError(f"Unexpected cached stable acc_version state for {image}: {detected_acc_version!r}")
+    return normalize_stream_version(detected_acc_version)
+
+
+def describe_available_rhds_stable_acc_versions(configured_acc_version: str, detected_versions: set[str]) -> str:
+    configured_minor = parse_minor_version(configured_acc_version)
+    sorted_versions = sorted(detected_versions, key=parse_minor_version)
+    older = [version for version in sorted_versions if parse_minor_version(version) < configured_minor]
+    newer = [version for version in sorted_versions if parse_minor_version(version) > configured_minor]
+
+    if older and not newer:
+        label = "older acc_version" if len(older) == 1 else "older acc_versions"
+        return f"{label} {', '.join(older)}"
+    if newer and not older:
+        label = "newer acc_version" if len(newer) == 1 else "newer acc_versions"
+        return f"{label} {', '.join(newer)}"
+    return f"older and newer acc_versions {', '.join(sorted_versions)}"
+
+
+def resolve_matching_published_rhds_stable_image(
+    repository: str,
+    release_version: str,
+    accelerator: str,
+    configured_acc_version: str,
+    tag_cache: dict[str, tuple[str, ...]] | None,
+    stable_acc_version_cache: dict[tuple[str, str], str | object | None],
+) -> str:
+    configured_normalized = normalize_stream_version(configured_acc_version)
+    candidates = sorted(
+        (
+            (int(match.group("build") or 0), tag)
+            for tag in list_rhds_repository_tags(repository, tag_cache)
+            if (match := RHDS_STABLE_TAG_RE.fullmatch(tag)) is not None and match.group("version") == release_version
+        ),
+        reverse=True,
+    )
+
+    if not candidates:
+        raise ValueError(f"No published RHDS stable tags found for release '{release_version}'")
+
+    unresolved_images: list[str] = []
+    detected_versions: set[str] = set()
+    for _build, tag in candidates:
+        image = f"{repository}:{tag}"
+        detected_acc_version = cached_rhds_stable_acc_version(image, accelerator, stable_acc_version_cache)
+        if detected_acc_version in (_STABLE_ACC_VERSION_INSPECT_FAILED, None):
+            unresolved_images.append(image)
+            continue
+        if not isinstance(detected_acc_version, str):
+            raise TypeError(f"Unexpected stable acc_version state for {image}: {detected_acc_version!r}")
+        if detected_acc_version == configured_normalized:
+            return image
+        detected_versions.add(detected_acc_version)
+
+    if unresolved_images:
+        detail = ""
+        if detected_versions:
+            detail = (
+                " Candidate stable images inspected successfully appear to use "
+                f"{describe_available_rhds_stable_acc_versions(configured_normalized, detected_versions)}."
+            )
+        raise ValueError(
+            f"Could not determine whether any published RHDS stable {accelerator} image in {repository} for "
+            f"release '{release_version}' matches configured shared acc_version {configured_normalized}; one or "
+            f"more candidate stable images could not be inspected or did not expose an acc_version.{detail}"
+        )
+
+    raise ValueError(
+        f"No published RHDS stable {accelerator} image in {repository} for release '{release_version}' matches "
+        f"configured shared acc_version {configured_normalized}; available stable images appear to use "
+        f"{describe_available_rhds_stable_acc_versions(configured_normalized, detected_versions)}."
+    )
+
+
+def select_latest_matching_rhds_tag(tags: list[str], candidate_tag: str) -> str:
+    match = RHDS_TAG_RE.fullmatch(candidate_tag)
+    if match is None:
+        raise ValueError(f"Unsupported RHDS candidate tag: {candidate_tag}")
+    prefix = match.group("version")
+    if phase := match.group("phase"):
+        prefix = f"{prefix}-{phase}"
+    family_pattern = re.compile(rf"^{re.escape(prefix)}-(?P<build>\d+)$")
+    matches = [(int(match.group("build")), tag) for tag in tags if (match := family_pattern.fullmatch(tag)) is not None]
+
+    if not matches:
+        raise ValueError(f"No matching published RHDS tag found for family '{candidate_tag}'")
+
+    return max(matches, key=lambda item: item[0])[1]
+
+
+def select_latest_progressing_rhds_tag(tags: list[str], candidate_tag: str) -> str | None:
+    """Return the latest published tag at or above the candidate phase for the same release."""
+    candidate_match = RHDS_TAG_RE.fullmatch(candidate_tag)
+    if candidate_match is None:
+        raise ValueError(f"Unsupported RHDS candidate tag: {candidate_tag}")
+
+    release_version = candidate_match.group("version")
+    minimum_phase_rank = rank_rhds_phase(candidate_match.group("phase"))
+    matches = [
+        (rank_rhds_phase(match.group("phase")), int(match.group("build")), tag)
+        for tag in tags
+        if (match := RHDS_TAG_RE.fullmatch(tag)) is not None
+        and match.group("version") == release_version
+        and rank_rhds_phase(match.group("phase")) >= minimum_phase_rank
+    ]
+    if not matches:
+        return None
+    return max(matches)[2]
+
+
+def determine_highest_published_rhds_phase_for_release(
+    repository: str,
+    release_version: str,
+    tag_cache: dict[str, tuple[str, ...]] | None = None,
+) -> str | None:
+    phases = {
+        match.group("phase")
+        for tag in list_rhds_repository_tags(repository, tag_cache)
+        if (match := RHDS_TAG_RE.fullmatch(tag)) is not None and match.group("version") == release_version
+    }
+
+    if not phases:
+        return "ea.1"
+    return max(phases, key=rank_rhds_phase)
+
+
+def select_highest_published_rhds_tag_for_release(tags: list[str], release_version: str) -> str:
+    matches = [
+        (rank_rhds_phase(match.group("phase")), int(match.group("build")), tag)
+        for tag in tags
+        if (match := RHDS_TAG_RE.fullmatch(tag)) is not None and match.group("version") == release_version
+    ]
+
+    if not matches:
+        raise ValueError(f"No published RHDS tags found for release '{release_version}'")
+
+    return max(matches)[2]
+
+
+def list_rhds_repository_tags(
+    repository: str,
+    tag_cache: dict[str, tuple[str, ...]] | None = None,
+) -> tuple[str, ...]:
+    if tag_cache is not None and repository in tag_cache:
+        return tag_cache[repository]
+
+    try:
+        result = subprocess.run(
+            ["skopeo", "list-tags", "--retry-times", "3", f"docker://{repository}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError("skopeo is required to resolve latest RHDS tags") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(f"skopeo list-tags timed out for {repository}") from exc
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip() or f"exit code {result.returncode}"
+        raise ValueError(f"skopeo list-tags failed for {repository}: {detail}")
+
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"skopeo list-tags returned invalid JSON for {repository}") from exc
+
+    tags = payload.get("Tags")
+    if not isinstance(tags, list) or not all(isinstance(tag, str) for tag in tags):
+        raise ValueError(f"skopeo list-tags returned invalid tags for {repository}")
+
+    resolved_tags = tuple(tags)
+    if tag_cache is not None:
+        tag_cache[repository] = resolved_tags
+    return resolved_tags
+
+
+def resolve_latest_published_rhds_image(
+    candidate_image: str,
+    tag_cache: dict[str, tuple[str, ...]] | None = None,
+) -> str:
+    repository, candidate_tag = split_image_ref(candidate_image)
+    tags = list(list_rhds_repository_tags(repository, tag_cache))
+    candidate_match = RHDS_TAG_RE.fullmatch(candidate_tag)
+    if candidate_match is None:
+        raise ValueError(f"Unsupported RHDS candidate tag: {candidate_tag}")
+
+    latest_tag = select_latest_progressing_rhds_tag(tags, candidate_tag)
+    if latest_tag is not None:
+        return f"{repository}:{latest_tag}"
+
+    if candidate_match.group("phase") is not None:
+        raise ValueError(f"No matching published RHDS tag found for family '{candidate_tag}'")
+
+    latest_tag = select_highest_published_rhds_tag_for_release(tags, candidate_match.group("version"))
+    return f"{repository}:{latest_tag}"
+
+
+def build_rhds_pinned_repository(accelerator: str, version: str, release: ReleaseConfig) -> str:
+    if accelerator == "cpu":
+        return f"quay.io/aipcc/base-images/cpu-{release.rhds_os_base}"
+    normalized_version = normalize_stream_version(version)
+    return f"quay.io/aipcc/base-images/{accelerator}-{normalized_version}-{release.rhds_os_base}"
+
+
+def build_rhds_gpu_stable_repository(
+    accelerator: str,
+    release: ReleaseConfig,
+    stable_repo_overrides: dict[str, str] | None = None,
+) -> str:
+    if accelerator not in RHDS_STABLE_OVERRIDE_ACCELERATORS:
+        raise ValueError(f"Unsupported RHDS stable accelerator: {accelerator}")
+    if stable_repo_overrides and accelerator in stable_repo_overrides:
+        return stable_repo_overrides[accelerator]
+    return f"quay.io/aipcc/base-images/{accelerator}-stable"
+
+
+def describe_rhds_phase(phase: str | None) -> str:
+    return "GA" if phase is None else phase
+
+
+def rank_rhds_phase(phase: str | None) -> int:
+    if phase is None:
+        return 10_000
+    return int(phase.removeprefix("ea."))
+
+
+def build_rhds_seed_tag(release_version: str, phase: str | None) -> str:
+    if phase is None:
+        return f"{release_version}-0"
+    return f"{release_version}-{phase}-0"
+
+
+def determine_rhds_fast_bundle_phase(
+    states: list[TargetState],
+    release: ReleaseConfig,
+    *,
+    source_tag_by_digest: dict[str, str] | None = None,
+    digest_cache: dict[str, str] | None = None,
+    digest_to_tag_by_repository: dict[str, dict[str, str]] | None = None,
+) -> tuple[bool, str | None]:
+    target_version = parse_release_version(release.full_version)
+    same_release_phases: set[str | None] = set()
+
+    for peer_state in states:
+        if peer_state.target.is_baseline:
+            continue
+        if peer_state.target.distribution != "rhds":
+            continue
+        if peer_state.policy.mode != "fast":
+            continue
+
+        peer_tag = image_tag_from_reference(
+            peer_state.current_base_image,
+            source_tag_by_digest=source_tag_by_digest,
+            digest_cache=digest_cache,
+            digest_to_tag_by_repository=digest_to_tag_by_repository,
+        )
+        if peer_tag is None:
+            continue
+        match = RHDS_TAG_RE.fullmatch(peer_tag)
+        if match is None:
+            continue
+
+        peer_version = parse_release_version(match.group("version"))
+        if peer_version > target_version:
+            continue
+        if peer_version == target_version:
+            same_release_phases.add(match.group("phase"))
+
+    if not same_release_phases:
+        return False, None
+    highest_phase = max(same_release_phases, key=rank_rhds_phase)
+    return True, highest_phase
+
+
+def build_rhds_pinned_tag(
+    current_tag: str,
+    target_release_version: str,
+    *,
+    use_bundle_phase: bool = False,
+    bundle_phase: str | None = None,
+    forward_phase: str | None = "ea.1",
+) -> str:
+    match = RHDS_TAG_RE.fullmatch(current_tag)
+    if match is None:
+        raise ValueError(f"Unsupported RHDS BASE_IMAGE tag: {current_tag}")
+
+    current_version = parse_release_version(match.group("version"))
+    target_version = parse_release_version(target_release_version)
+    build = match.group("build")
+
+    # Phase precedence: rollback -> same-release bundle -> forward-discovered
+    # phase -> current tag phase.
+    if target_version < current_version:
+        phase = None
+    elif use_bundle_phase:
+        phase = bundle_phase
+    elif target_version > current_version:
+        phase = forward_phase
+    else:
+        phase = match.group("phase")
+
+    if phase is None:
+        return f"{target_release_version}-{build}"
+    return f"{target_release_version}-{phase}-{build}"
+
+
+def build_rhds_pinned_image(
+    accelerator: str,
+    version: str,
+    current_base_image: str,
+    target_release_version: str,
+    release: ReleaseConfig,
+    *,
+    use_bundle_phase: bool = False,
+    bundle_phase: str | None = None,
+    forward_phase: str | None = "ea.1",
+    source_tag_by_digest: dict[str, str] | None = None,
+    digest_cache: dict[str, str] | None = None,
+    digest_to_tag_by_repository: dict[str, dict[str, str]] | None = None,
+) -> str:
+    current_tag = image_tag_from_reference(
+        current_base_image,
+        source_tag_by_digest=source_tag_by_digest,
+        digest_cache=digest_cache,
+        digest_to_tag_by_repository=digest_to_tag_by_repository,
+    )
+    if current_tag is None:
+        raise ValueError(f"Cannot determine RHDS tag for digested image {current_base_image}")
+    repository = build_rhds_pinned_repository(accelerator, version, release)
+    return f"{repository}:{build_rhds_pinned_tag(current_tag, target_release_version, use_bundle_phase=use_bundle_phase, bundle_phase=bundle_phase, forward_phase=forward_phase)}"
+
+
+def build_odh_in_house_image(accelerator: str, version: str, release: ReleaseConfig) -> str:
+    repositories = {
+        "cpu": f"quay.io/opendatahub/odh-base-image-cpu-py{compact_python_version(release.python_version)}-c9s",
+        "cuda": "quay.io/opendatahub/odh-base-image-cuda-py312-c9s",
+        "rocm": "quay.io/opendatahub/odh-base-image-rocm-py312-c9s",
+    }
+    if accelerator not in repositories:
+        raise ValueError(f"Unsupported ODH in-house accelerator: {accelerator}")
+
+    if accelerator == "cpu":
+        tag = version
+    else:
+        tag = f"v{normalize_stream_version(version)}"
+    return f"{repositories[accelerator]}:{tag}"
+
+
+def build_odh_midstream_image(accelerator: str, version: str, release: ReleaseConfig) -> str:
+    normalized_version = normalize_stream_version(version).replace(".", "-")
+    if accelerator == "cpu":
+        return f"quay.io/opendatahub/odh-midstream-python-base-{hyphenated_python_version(release.python_version)}:{version}"
+    return f"quay.io/opendatahub/odh-midstream-{accelerator}-base-{normalized_version}:latest"
+
+
+def target_rhds_release_version(target: ConfTarget, policy: BaseImagePolicy, release: ReleaseConfig) -> str:
+    if target.distribution != "rhds":
+        raise ValueError(f"Unsupported distribution in {target.path}: {target.distribution}")
+    if target.accelerator == "cpu" and policy.version is not None:
+        return policy.version
+    return release.full_version
+
+
+def default_rhds_seed_phase(
+    *,
+    rhds_bundle_phase_known: bool,
+    use_release_bundle_phase: bool,
+    rhds_bundle_phase: str | None,
+) -> str | None:
+    if rhds_bundle_phase_known and use_release_bundle_phase:
+        return rhds_bundle_phase
+    return "ea.1"
+
+
+def build_rhel_python_base_repository(release: ReleaseConfig) -> str:
+    return f"registry.redhat.io/rhel9/python-{compact_python_version(release.python_version)}"
+
+
+def rhel_python_os_stream(release: ReleaseConfig) -> str:
+    if not release.rhds_os_base.startswith("el"):
+        raise ValueError(f"release.rhds_os_base must start with 'el', got {release.rhds_os_base!r}")
+    return release.rhds_os_base[2:]
+
+
+def select_latest_rhel_python_tag(tags: tuple[str, ...], os_stream: str) -> str:
+    matching: list[tuple[int, str]] = []
+    for tag in tags:
+        match = RHEL_PYTHON_TAG_RE.fullmatch(tag)
+        if match is None or match.group("os_stream") != os_stream:
+            continue
+        matching.append((int(match.group("build")), tag))
+    if not matching:
+        raise ValueError(f"No RHEL python base tag found for os stream {os_stream}")
+    return max(matching)[1]
+
+
+def resolve_rhel_python_base_image(
+    release: ReleaseConfig,
+    tag_cache: dict[str, tuple[str, ...]],
+) -> str:
+    repository = build_rhel_python_base_repository(release)
+    os_stream = rhel_python_os_stream(release)
+    latest_tag = select_latest_rhel_python_tag(list_rhds_repository_tags(repository, tag_cache), os_stream)
+    return f"{repository}:{latest_tag}"
+
+
+def resolve_rhds_base_image(
+    state: TargetState,
+    release: ReleaseConfig,
+    tag_cache: dict[str, tuple[str, ...]],
+    stable_acc_version_cache: dict[tuple[str, str], str | object | None],
+    rhds_bundle_phase_known: bool,
+    rhds_bundle_phase: str | None,
+    stable_repo_overrides: dict[str, str] | None = None,
+    source_tag_by_digest: dict[str, str] | None = None,
+    digest_cache: dict[str, str] | None = None,
+    digest_to_tag_by_repository: dict[str, dict[str, str]] | None = None,
+) -> str:
+    target = state.target
+    policy = state.policy
+    current_base_image = state.current_base_image
+
+    if policy.mode == "rhel":
+        return resolve_rhel_python_base_image(release, tag_cache)
+
+    if policy.mode == "stable":
+        if target.accelerator == "cpu":
+            return f"quay.io/aipcc/base-image-cpu-stable-ubi9:{release_minor_version(release.full_version)}"
+        if state.shared_acc_version is None:
+            raise ValueError(f"Missing configured shared acc_version for RHDS stable {target.accelerator}")
+        repository = build_rhds_gpu_stable_repository(
+            target.accelerator,
+            release,
+            stable_repo_overrides,
+        )
+        return resolve_matching_published_rhds_stable_image(
+            repository,
+            release.full_version,
+            target.accelerator,
+            state.shared_acc_version,
+            tag_cache,
+            stable_acc_version_cache,
+        )
+
+    if policy.version is None:
+        raise ValueError(f"Missing {policy_version_key(target.accelerator)} for rhds fast channel in {target.path}")
+
+    target_release_version = target_rhds_release_version(target, policy, release)
+    use_release_bundle_phase = target_release_version == release.full_version
+    bundle_seed_phase = default_rhds_seed_phase(
+        rhds_bundle_phase_known=rhds_bundle_phase_known,
+        use_release_bundle_phase=use_release_bundle_phase,
+        rhds_bundle_phase=rhds_bundle_phase,
+    )
+    repository = build_rhds_pinned_repository(target.accelerator, policy.version, release)
+    current_tag = image_tag_from_reference(
+        current_base_image,
+        source_tag_by_digest=source_tag_by_digest,
+        digest_cache=digest_cache,
+        digest_to_tag_by_repository=digest_to_tag_by_repository,
+    )
+
+    if current_tag is None:
+        candidate = f"{repository}:{build_rhds_seed_tag(target_release_version, bundle_seed_phase)}"
+    elif treat_as_rhds_stable_tag(current_base_image, current_tag):
+        stable_match = RHDS_STABLE_TAG_RE.fullmatch(current_tag)
+        if stable_match is None:
+            raise ValueError(f"stable tag did not match expected pattern: {current_tag}")
+        current_version = parse_release_version(stable_match.group("version"))
+        target_version = parse_release_version(target_release_version)
+        if current_version > target_version:
+            seed_phase = None
+        elif current_version < target_version:
+            seed_phase = determine_highest_published_rhds_phase_for_release(
+                repository,
+                target_release_version,
+                tag_cache,
+            )
+        else:
+            seed_phase = bundle_seed_phase
+        candidate = f"{repository}:{build_rhds_seed_tag(target_release_version, seed_phase)}"
+    elif RHDS_TAG_RE.fullmatch(current_tag) is None:
+        if MIDSTREAM_VERSION_RE.fullmatch(current_tag):
+            current_minor = parse_minor_version(current_tag)
+            target_minor = parse_minor_version(release_minor_version(target_release_version))
+            if current_minor > target_minor:
+                seed_phase = None
+            elif current_minor < target_minor:
+                seed_phase = determine_highest_published_rhds_phase_for_release(
+                    repository,
+                    target_release_version,
+                    tag_cache,
+                )
+            else:
+                seed_phase = bundle_seed_phase
+        else:
+            seed_phase = bundle_seed_phase
+        candidate = f"{repository}:{build_rhds_seed_tag(target_release_version, seed_phase)}"
+    else:
+        current_match = RHDS_TAG_RE.fullmatch(current_tag)
+        forward_phase = "ea.1"
+        current_version = parse_release_version(current_match.group("version"))
+        target_version = parse_release_version(target_release_version)
+        if target_version > current_version:
+            forward_phase = determine_highest_published_rhds_phase_for_release(
+                repository,
+                target_release_version,
+                tag_cache,
+            )
+        candidate = build_rhds_pinned_image(
+            target.accelerator,
+            policy.version,
+            current_base_image,
+            target_release_version,
+            release,
+            use_bundle_phase=rhds_bundle_phase_known and use_release_bundle_phase and target_version == current_version,
+            bundle_phase=rhds_bundle_phase,
+            forward_phase=forward_phase,
+            source_tag_by_digest=source_tag_by_digest,
+            digest_cache=digest_cache,
+            digest_to_tag_by_repository=digest_to_tag_by_repository,
+        )
+    return resolve_latest_published_rhds_image(candidate, tag_cache)
+
+
+def resolve_odh_base_image(state: TargetState, release: ReleaseConfig) -> str:
+    target = state.target
+    policy = state.policy
+
+    if policy.version is None:
+        raise ValueError(f"Missing {policy_version_key(target.accelerator)} for odh origin in {target.path}")
+    if policy.mode == "in-house":
+        return build_odh_in_house_image(target.accelerator, policy.version, release)
+    if policy.mode == "midstream":
+        return build_odh_midstream_image(target.accelerator, policy.version, release)
+    raise ValueError(f"Unsupported odh origin in {target.path}: {policy.mode}")
+
+
+def build_target_base_image(
+    state: TargetState,
+    release: ReleaseConfig,
+    tag_cache: dict[str, tuple[str, ...]],
+    stable_acc_version_cache: dict[tuple[str, str], str | object | None],
+    rhds_bundle_phase_known: bool,
+    rhds_bundle_phase: str | None,
+    stable_repo_overrides: dict[str, str] | None = None,
+    source_tag_by_digest: dict[str, str] | None = None,
+    digest_cache: dict[str, str] | None = None,
+    digest_to_tag_by_repository: dict[str, dict[str, str]] | None = None,
+) -> str:
+    match state.target.distribution:
+        case "rhds":
+            return resolve_rhds_base_image(
+                state,
+                release,
+                tag_cache,
+                stable_acc_version_cache,
+                rhds_bundle_phase_known,
+                rhds_bundle_phase,
+                stable_repo_overrides,
+                source_tag_by_digest,
+                digest_cache,
+                digest_to_tag_by_repository,
+            )
+        case "odh":
+            return resolve_odh_base_image(state, release)
+        case _:
+            raise ValueError(f"Unsupported distribution in {state.target.path}: {state.target.distribution}")
+
+
+def read_conf_assignments(text: str) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        assignments[key.strip()] = value.strip()
+    return assignments
+
+
+def rewrite_conf_text(text: str, replacements: dict[str, str]) -> str:
+    return rewrite_assignment_text(
+        text,
+        replacements,
+        assignment_re=CONF_ASSIGNMENT_RE,
+        missing_context="build-args content",
+    )
+
+
+def rewrite_assignment_text(
+    text: str,
+    replacements: dict[str, str],
+    *,
+    assignment_re: re.Pattern[str],
+    missing_context: str,
+) -> str:
+    lines = text.splitlines(keepends=True)
+    found_keys: set[str] = set()
+    rewritten_lines: list[str] = []
+
+    for line in lines:
+        line_ending = "\n" if line.endswith("\n") else ""
+        body = line[:-1] if line_ending else line
+        match = assignment_re.fullmatch(body)
+        if match is None or match.group("key") not in replacements:
+            rewritten_lines.append(line)
+            continue
+
+        key = match.group("key")
+        found_keys.add(key)
+        rewritten_lines.append(f"{match.group('prefix')}{replacements[key]}{line_ending}")
+
+    missing_keys = [key for key in replacements if key not in found_keys]
+    if missing_keys:
+        raise ValueError(f"Missing {', '.join(missing_keys)} in {missing_context}")
+    return "".join(rewritten_lines)
+
+
+def rewrite_makefile_text(text: str, replacements: dict[str, str]) -> str:
+    return rewrite_assignment_text(
+        text,
+        replacements,
+        assignment_re=MAKEFILE_ASSIGNMENT_RE,
+        missing_context="Makefile",
+    )
+
+
+def build_conf_replacements(
+    assignments: dict[str, str], resolved_base_image: str, release: ReleaseConfig
+) -> dict[str, str]:
+    replacements = {"BASE_IMAGE": resolved_base_image}
+    if "RELEASE" in assignments:
+        replacements["RELEASE"] = release_minor_version(release.full_version)
+    return replacements
+
+
+def build_makefile_replacements(release: ReleaseConfig) -> dict[str, str]:
+    return {
+        "RELEASE": release_minor_version(release.full_version),
+        "RELEASE_PYTHON_VERSION": release.python_version,
+    }
+
+
+def plan_updates(
+    root_dir: Path,
+    config: VersionsConfig,
+    stable_repo_overrides: dict[str, str] | None = None,
+) -> list[PlannedUpdate]:
+    states: list[TargetState] = []
+    tag_cache: dict[str, tuple[str, ...]] = {}
+    stable_acc_version_cache: dict[tuple[str, str], str | object | None] = {}
+    source_tag_by_digest: dict[str, str] = {}
+    digest_cache: dict[str, str] = {}
+    digest_to_tag_by_repository: dict[str, dict[str, str]] = {}
+
+    for target in collect_conf_targets(root_dir):
+        original_text = target.path.read_text(encoding="utf-8")
+        assignments = read_conf_assignments(original_text)
+        current_base_image = assignments.get("BASE_IMAGE")
+        if current_base_image is None:
+            raise ValueError(f"Missing BASE_IMAGE in {target.path}")
+
+        states.append(
+            TargetState(
+                target=target,
+                original_text=original_text,
+                current_base_image=current_base_image,
+                policy=config.policy(
+                    target.accelerator,
+                    target.distribution,
+                    target.flavor,
+                    baseline=target.is_baseline,
+                ),
+                shared_acc_version=(
+                    None
+                    if target.accelerator == "cpu"
+                    else config.shared_acc_version(target.accelerator, target.flavor)
+                ),
+            )
+        )
+
+    rhds_bundle_phase_known, rhds_bundle_phase = determine_rhds_fast_bundle_phase(
+        states,
+        config.release,
+        source_tag_by_digest=source_tag_by_digest,
+        digest_cache=digest_cache,
+        digest_to_tag_by_repository=digest_to_tag_by_repository,
+    )
+
+    updates: list[PlannedUpdate] = []
+    for state in states:
+        resolved_base_image = resolve_image_digest(
+            build_target_base_image(
+                state,
+                config.release,
+                tag_cache,
+                stable_acc_version_cache,
+                rhds_bundle_phase_known,
+                rhds_bundle_phase,
+                stable_repo_overrides,
+                source_tag_by_digest,
+                digest_cache,
+                digest_to_tag_by_repository,
+            ),
+            digest_cache,
+            source_tag_by_digest,
+        )
+        updates.append(
+            PlannedUpdate(
+                path=state.target.path,
+                original_text=state.original_text,
+                updated_text=rewrite_conf_text(
+                    state.original_text,
+                    build_conf_replacements(
+                        read_conf_assignments(state.original_text), resolved_base_image, config.release
+                    ),
+                ),
+                target=state.target,
+            )
+        )
+
+    makefile = root_dir / "Makefile"
+    if makefile.is_file():
+        original_text = makefile.read_text(encoding="utf-8")
+        updates.append(
+            PlannedUpdate(
+                path=makefile,
+                original_text=original_text,
+                updated_text=rewrite_makefile_text(original_text, build_makefile_replacements(config.release)),
+            )
+        )
+
+    return updates
+
+
+def relative_display_path(root_dir: Path, path: Path) -> str:
+    return path.relative_to(root_dir).as_posix()
+
+
+def print_diff(root_dir: Path, update: PlannedUpdate) -> None:
+    relative_path = relative_display_path(root_dir, update.path)
+    diff = difflib.unified_diff(
+        update.original_text.splitlines(),
+        update.updated_text.splitlines(),
+        fromfile=relative_path,
+        tofile=relative_path,
+        lineterm="",
+    )
+    print("\n".join(diff))
+
+
+def parse_rhds_stable_repo_override(value: str) -> tuple[str, str]:
+    accelerator, separator, repository = value.partition("=")
+    normalized_accelerator = accelerator.strip().lower()
+    normalized_repository = repository.strip()
+    if separator == "" or not normalized_accelerator or not normalized_repository:
+        raise argparse.ArgumentTypeError("RHDS stable repo override must use ACCELERATOR=REPOSITORY")
+    if normalized_accelerator not in RHDS_STABLE_OVERRIDE_ACCELERATORS:
+        allowed = ", ".join(sorted(RHDS_STABLE_OVERRIDE_ACCELERATORS))
+        raise argparse.ArgumentTypeError(f"RHDS stable repo override accelerator must be one of: {allowed}")
+    return normalized_accelerator, normalized_repository
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=ROOT_DIR, help="Repository root to scan")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help="Path to versions_config.yml")
+    parser.add_argument("--dry-run", action="store_true", help="Show changes without writing files")
+    parser.add_argument("--check", action="store_true", help="Exit non-zero if files need updates")
+    parser.add_argument(
+        "--rhds-stable-repo-override",
+        action="append",
+        default=[],
+        type=parse_rhds_stable_repo_override,
+        metavar="ACCELERATOR=REPOSITORY",
+        help="Override RHDS GPU stable repository for local testing; repeat for cuda/rocm",
+    )
+    args = parser.parse_args(argv)
+    stable_repo_overrides: dict[str, str] = {}
+    for accelerator, repository in args.rhds_stable_repo_override:
+        if accelerator in stable_repo_overrides:
+            parser.error(f"duplicate --rhds-stable-repo-override for accelerator '{accelerator}'")
+        stable_repo_overrides[accelerator] = repository
+    args.rhds_stable_repo_overrides = stable_repo_overrides
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    config = load_versions_config(args.config)
+    updates = plan_updates(args.root, config, args.rhds_stable_repo_overrides)
+    changed_updates = [update for update in updates if update.original_text != update.updated_text]
+
+    if args.dry_run or args.check:
+        for update in changed_updates:
+            print_diff(args.root, update)
+        if changed_updates:
+            print(f"{len(changed_updates)} build-args file(s) need updates.")
+        else:
+            print("Build-args files already match versions_config.yml.")
+        return 1 if args.check and changed_updates else 0
+
+    for update in changed_updates:
+        update.path.write_text(update.updated_text, encoding="utf-8")
+        print(f"Updated {relative_display_path(args.root, update.path)}")
+
+    if not changed_updates:
+        print("Build-args files already match versions_config.yml.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

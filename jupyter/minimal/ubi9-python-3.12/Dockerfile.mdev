@@ -1,8 +1,9 @@
 ####################
 # base             #
 ####################
-ARG BASE_IMAGE="registry.redhat.io/rhaii-early-access/vllm-spyre-rhel9"
-ARG BASE_IMAGE_TAG="3.4.0-ea.2"
+# Base image and tag are defined in build-args/mdev.conf
+ARG BASE_IMAGE
+ARG BASE_IMAGE_TAG
 FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 
 # Note: This Dockerfile is designed to work on both native Linux/x86_64 and
@@ -10,12 +11,51 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 # to the entrypoint script to avoid issues during build.
 
 ENV APP_ROOT=/opt/app-root
-ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src
+ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src/notebooks
 
-# Note: pip install commands are deferred to runtime to avoid QEMU emulation issues
-# They will be executed by the start-notebook.sh script on first run
+# The Spyre base image runs as senuser (uid 1234) and ships no "default" user,
+# so create the RHOAI/OpenShift-convention user (uid 1001, gid 0) that the
+# entrypoint and workbench tooling expect. Root is needed for useradd and to
+# open up /usr/local so pip can install as an unprivileged user.
+USER 0
 
+RUN useradd -u 1001 -g 0 -m -G wheel -s /bin/bash default && \
+    chmod -R ugo+rwX /usr/local/lib64/python3.12/site-packages && \
+    chmod -R ugo+rwX /usr/local/lib/python3.12/site-packages && \
+    chmod -R ugo+rwX /usr/local
+
+RUN chown -R default:0 /usr/local/*
+
+# Create the app-root layout the entrypoint and RHOAI expect. ${APP_ROOT}/etc
+# and ${APP_ROOT}/src must stay writable: the entrypoint copies senlib configs
+# into them at runtime as the unprivileged user.
+RUN mkdir -p ${APP_ROOT}/src ${APP_ROOT}/etc ${APP_ROOT}/bin ${NOTEBOOK_ROOT_DIR} && \
+    cp /opt/ibm/spyre/senlib/etc/senlib*.json ${APP_ROOT}/etc/ && \
+    chown -R default:0 ${APP_ROOT} && \
+    chmod -R ugo+rwX ${APP_ROOT}
+
+# HOME is ${APP_ROOT}/src (not NOTEBOOK_ROOT_DIR) so that the entrypoint's
+# "cd ~/notebooks" resolves to ${NOTEBOOK_ROOT_DIR}.
+ENV HOME=${APP_ROOT}/src
+ENV PATH="${HOME}/.local/bin:${PATH}"
+ENV PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${HOME}/.local/lib64/python3.12/site-packages:${PYTHONPATH}"
+
+# Other apps and tools installed as the default user
+USER default
+
+# Install jupyterlab and ipywidgets
+RUN python3 -m pip install --no-cache-dir --upgrade pip && \
+    pip3 install --no-cache-dir --index-url https://pypi.org/simple jupyterlab && \
+    pip3 install --no-cache-dir --index-url https://pypi.org/simple --upgrade ipywidgets jupyterlab_widgets && \
+    pip3 install --no-deps --index-url https://pypi.org/simple aiu-fms-testing-utils==0.7.1 && \
+    pip3 show jupyterlab
+
+# Copy the start-notebook.sh script
 COPY --chown=default:0 --chmod=755 jupyter/minimal/ubi9-python-3.12/start-notebook-mdev.sh /opt/app-root/bin/start-notebook.sh
+
+
+# Runtime user (already default, stated explicitly for clarity).
+USER default
 
 WORKDIR ${NOTEBOOK_ROOT_DIR}
 

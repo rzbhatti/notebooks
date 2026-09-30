@@ -9,9 +9,32 @@ FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} as base
 # Note: This Dockerfile is designed to work on both native Linux/x86_64 and
 # cross-platform builds from Apple Silicon Macs. User setup is deferred
 # to the entrypoint script to avoid issues during build.
+#
+# This image bakes in the full Spyre inference stack -- torch-spyre, hf-adapters,
+# vLLM and the spyre-inference vLLM platform plugin -- as ONE pinned, system-level
+# Python environment with NO virtualenv. Notebooks, terminal offline inference and
+# `vllm serve` all use the same interpreter (/usr/bin/python3), so nothing has to
+# be installed or activated at runtime. See VLLM-SPYRE-SETUP.md for how the pin
+# set was derived and why each override exists.
 
 ENV APP_ROOT=/opt/app-root
 ENV NOTEBOOK_ROOT_DIR=/opt/app-root/src/notebooks
+
+# Revisions of the four source-built components, as ARGs so that a base image
+# bump (new ibm-flex) is a one-line change here.
+#
+# IMPORTANT -- TORCH_SPYRE_REV is version-critical and is deliberately NOT the
+# upstream tag. torch-spyre v0.5.0-rc.1 and newer call
+# flex::compositeAddressToDeviceAddress, which this base image's ibm-flex does not
+# provide (it ships only flex::compositeAddressToDmva), so the tag fails to
+# compile. fcac2334fd is the last commit using the dmva API; hf-adapters upstream
+# pins the same commit. Re-verify on every base image bump with:
+#     grep -r compositeAddressToDeviceAddress /opt/ibm/spyre
+# Once that matches, this can move forward to the tag.
+ARG TORCH_SPYRE_REV=fcac2334fd6019efbc89e3ea5eea560d8a7ded0e
+ARG VLLM_REV=2cf0a6915ce544dc493a0990f2ea38d81601128a
+ARG SPYRE_INFERENCE_REV=2ef23a322daf0157f4d155656ef3a121790fde63
+ARG HF_ADAPTERS_REV=d1bda3b3f7e296633e7b7815d69785d00b9c0c93
 
 # The Spyre base image runs as senuser (uid 1234) and ships no "default" user,
 # so create the RHOAI/OpenShift-convention user (uid 1001, gid 0) that the
@@ -38,7 +61,16 @@ RUN mkdir -p ${APP_ROOT}/src ${APP_ROOT}/etc ${APP_ROOT}/bin ${NOTEBOOK_ROOT_DIR
 # "cd ~/notebooks" resolves to ${NOTEBOOK_ROOT_DIR}.
 ENV HOME=${APP_ROOT}/src
 ENV PATH="${HOME}/.local/bin:${PATH}"
-ENV PYTHONPATH="${HOME}/.local/lib/python3.12/site-packages:${HOME}/.local/lib64/python3.12/site-packages:${PYTHONPATH}"
+
+# NOTE: ${HOME}/.local/{lib,lib64}/python3.12/site-packages was previously on
+# PYTHONPATH and has been deliberately removed. ${HOME} is ${APP_ROOT}/src, a
+# mounted PVC that survives every image rebuild. On PYTHONPATH those entries
+# landed at sys.path index 3, ahead of /usr/local/lib/python3.12/site-packages at
+# index 9 -- so one stale `pip install --user` on the PVC would silently shadow
+# the baked-in stack forever and defeat the point of preinstalling it. Dropping
+# them does not break `pip install --user` (site.USER_SITE still applies); it only
+# stops the PVC from outranking the image. The entrypoint warns when a .local
+# site-packages is present.
 
 # Other apps and tools installed as the default user
 USER default
@@ -50,6 +82,252 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip && \
     pip3 install --no-deps --index-url https://pypi.org/simple aiu-fms-testing-utils==0.7.1 && \
     pip3 show jupyterlab
 
+#####################################################################
+# Spyre inference stack: torch-spyre + hf-adapters + vLLM + plugin   #
+#####################################################################
+# Installed system-wide into /usr/local (no venv). /usr/local precedes /usr on
+# sys.path, so these pins shadow the older rpm-provided urllib3, requests, six
+# and idna without touching any rpm-owned file. --ignore-installed is required
+# for exactly that reason: without it pip tries to uninstall the rpm-owned
+# urllib3 and fails with "The package's contents are unknown: no RECORD file".
+#
+# `pip check` on the finished image reports 12 unmet requirements. ALL of them are
+# expected; none is a real defect. Verified on kenneth-staging-0, 2026-09-28:
+#
+#   torch_sendnn wants torch<=2.10.0
+#   aiu-fms-testing-utils wants torch==2.10.0, numpy<2.3.0, transformers<=4.58
+#     -> both predate torch 2.13.0. torch_sendnn is known-broken legacy in this
+#        base image (it cannot even `import sendnn`) and registers only lazy torch
+#        dynamo backends, never a device backend, so it cannot interfere with
+#        torch_spyre. aiu-fms-testing-utils is installed --no-deps and kept only
+#        for the inference.py script the entrypoint references.
+#   spyre-inference wants torch-spyre[cpsat]>=0.5.0rc1, but reports 0.0.1
+#     -> a REPORTING artifact of pinning by commit SHA: setuptools-scm has no tag
+#        to describe at fcac2334fd and falls back to 0.0.1. The version string is
+#        wrong, the code is right. The [cpsat] extra's actual payload (ortools) IS
+#        installed, so the dependency is functionally satisfied. Permanent for as
+#        long as TORCH_SPYRE_REV is a SHA rather than a tag.
+#   hf-adapters-spyre wants mistral-common==1.11.7, but we ship 1.12.0
+#     -> 1.12.0 is what the unified resolution produced; it imports cleanly, and
+#        it is only reachable through vLLM's Mistral tokenizer path, which
+#        GraniteForCausalLM never touches. hf-adapters' `==` is stricter than its
+#        code needs.
+#   hf-adapters-spyre wants sentence-transformers (absent)
+#     -> used only by hf_adapters/st_backend.py, an embedding-model monkeypatch.
+#        Not on any causal-LM path. Omitted deliberately; it would drag in a
+#        second torch resolution.
+#   xgrammar wants triton (absent)
+#     -> triton has no Spyre backend; see the --no-deps note above.
+#   torchvision wants torch==2.14.0; vllm wants setuptools<81 (we have 84)
+#     -> the two uv `override-dependencies` that pip cannot express. See the
+#        Step 2 / Step 3 comments.
+#
+# If `pip check` ever grows a THIRTEENTH line, treat it as a regression and
+# investigate rather than adding it to this list.
+
+COPY --chown=default:0 jupyter/minimal/ubi9-python-3.12/spyre-unified-requirements.txt \
+                       jupyter/minimal/ubi9-python-3.12/spyre-unified-nodeps.txt \
+                       /tmp/
+
+# Step 1: the fully-pinned PyPI set (torch 2.13.0+cpu, transformers 5.15.0,
+# tokenizers 0.22.2, numpy 2.3.5, setuptools 84.0.0, accelerate 1.15.0, ...).
+# accelerate is NOT in spyre-inference's lock -- it is required only by the
+# hf-adapters device_map path. See note 4 in the requirements file.
+RUN python3 -m pip install --no-cache-dir --ignore-installed \
+        -r /tmp/spyre-unified-requirements.txt
+
+# Step 2: packages whose own metadata is wrong for this stack, so they must skip
+# dependency resolution. torchvision declares torch==2.14.0; xgrammar declares an
+# unconditional triton on linux/x86_64. Either would break the pin set -- the
+# file's header explains why skipping their deps loses nothing.
+RUN python3 -m pip install --no-cache-dir --ignore-installed --no-deps \
+        -r /tmp/spyre-unified-nodeps.txt
+
+# Step 3: the four source-built components.
+#
+# All build with --no-build-isolation so they compile against the torch
+# 2.13.0+cpu and setuptools 84.0.0 installed above instead of re-resolving their
+# own conflicting build-time pins. vLLM's build-system asks for
+# setuptools<81.0.0; the plugin deliberately overrides that to 84.0.0 for a CVE
+# fix and the build succeeds with 84. Build deps that isolation would otherwise
+# have supplied are installed explicitly first (hatchling/hatch-vcs for
+# hf-adapters' in-tree build backend, setuptools-rust for vLLM's setup.py import).
+#
+# VLLM_TARGET_DEVICE=empty builds vLLM with no device C kernels and no vllm._C --
+# Spyre supplies its own ops through the platform plugin. It also skips vLLM's
+# Rust frontend, so this image needs no Rust toolchain.
+# cmake is a build-only dependency and comes from the pip wheel.
+# torch-spyre's setup.py uses three env vars to locate the native SDK headers
+# shipped by the base image:
+#   SPYRE_COMMS_INSTALL_DIR  -- spyre-comms/{include,lib}; required for CCL build
+#   RUNTIME_INSTALL_DIR      -- runtime/include:  flex/flex.hpp and libflex.so
+#   SENLIB_INSTALL_DIR       -- senlib/include:   buildversion.h etc.
+#   DEEPTOOLS_INSTALL_DIR    -- deeptools/include: sendefs.h, spyrecode-host-functions/
+# Without these, every .cpp in torch_spyre/csrc fails with:
+#   "fatal error: flex/flex.hpp: No such file or directory"
+#
+# LD_LIBRARY_PATH: the base image sets runtime/lib, deeptools/lib, senlib/lib but
+# NOT spyre-comms/lib. torch_spyre._C links against libspyre_comms.so.1; without
+# this path the import fails at runtime with:
+#   "ImportError: libspyre_comms.so.1: cannot open shared object file"
+ENV VLLM_TARGET_DEVICE=empty \
+    CMAKE_ARGS="--fresh" \
+    USE_SPYRE_PROFILER=0 \
+    SPYRE_COMMS_INSTALL_DIR=/opt/ibm/spyre/spyre-comms \
+    RUNTIME_INSTALL_DIR=/opt/ibm/spyre/runtime \
+    SENLIB_INSTALL_DIR=/opt/ibm/spyre/senlib \
+    DEEPTOOLS_INSTALL_DIR=/opt/ibm/spyre/deeptools \
+    LD_LIBRARY_PATH=/opt/ibm/spyre/spyre-comms/lib:/opt/ibm/spyre/runtime/lib:/opt/ibm/spyre/deeptools/lib:/opt/ibm/spyre/senlib/lib:/opt/ibm/spyre/sentinyexec/lib
+
+RUN python3 -m pip install --no-cache-dir --ignore-installed \
+        "setuptools-scm>=8.0" "setuptools-rust>=1.9.0" wheel jinja2 \
+        "packaging>=24.2" "cmake>=3.26.1" ninja hatchling hatch-vcs && \
+    MAX_JOBS="$(nproc)" CMAKE_BUILD_PARALLEL_LEVEL="$(nproc)" \
+    python3 -m pip install --no-cache-dir --ignore-installed --no-build-isolation --no-deps \
+        "torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@${TORCH_SPYRE_REV}" \
+        "vllm @ git+https://github.com/vllm-project/vllm@${VLLM_REV}" \
+        "spyre-inference @ git+https://github.com/torch-spyre/spyre-inference@${SPYRE_INFERENCE_REV}" \
+        "hf-adapters-spyre @ git+https://github.com/torch-spyre/hf-adapters@${HF_ADAPTERS_REV}"
+
+# OpenShift runs the pod as an arbitrary uid (not 1001), with gid 0. Everything
+# pip just wrote is mode 644 owned by `default`, because the `chmod -R ugo+rwX`
+# near the top of this file ran BEFORE these installs. Reading is fine -- gid 0
+# gets r-x, which is all the preinstalled stack needs -- but without this a user
+# in a running pod cannot `pip install` anything at all (it fails with
+# "[Errno 13] Permission denied: .../rpds/__init__.py" on an existing file it
+# tries to replace). Measured on kenneth-staging-0 as uid 1000930000: 14459 files
+# were unwritable. Re-applying group ownership and group-write keeps the image
+# usable for ad-hoc installs without granting world-write.
+USER 0
+RUN chown -R default:0 /usr/local/lib/python3.12/site-packages \
+                       /usr/local/lib64/python3.12/site-packages \
+                       /usr/local/bin && \
+    chmod -R g+rwX /usr/local/lib/python3.12/site-packages \
+                   /usr/local/lib64/python3.12/site-packages \
+                   /usr/local/bin
+USER default
+
+# Fail the build early rather than shipping a broken image: the whole stack must
+# import, torch must be the pinned version, triton must be absent (it has no
+# Spyre backend and pulls in GPU assumptions), and vLLM must see the platform
+# plugin -- without it vLLM silently selects the CPU platform and never touches
+# the card.
+RUN python3 -c "import torch, torch_spyre, hf_adapters, vllm, spyre_inference; \
+import importlib.util as u; \
+assert torch.__version__.startswith('2.13.0'), torch.__version__; \
+assert u.find_spec('triton') is None, 'triton must not be installed'; \
+print('spyre stack OK: torch', torch.__version__, '| vllm', vllm.__version__)" && \
+    python3 -c "import importlib.metadata as m; \
+eps=[e.value for e in m.entry_points().select(group='vllm.platform_plugins')]; \
+assert any('spyre_inference' in e for e in eps), eps; \
+print('platform plugin registered:', eps)"
+
+# Step 3 installs all four source components with --no-deps, so pip never fetches
+# their declared dependencies -- and `pip check` does NOT report an absent
+# unversioned dependency (only version conflicts). That combination hid a missing
+# `accelerate` until run_granite_spyre.py failed at runtime with
+#   ValueError: Using a `device_map` ... requires `accelerate`
+# This layer closes that hole: for each --no-deps component, every unversioned,
+# unconditional (no-marker, no-extra) requirement must actually be importable as a
+# distribution. Deliberate omissions are listed in ALLOWED_MISSING with a reason;
+# anything else fails the build here instead of in a user's notebook.
+RUN python3 - <<'PYEOF'
+import importlib.metadata as m
+from packaging.requirements import Requirement
+
+NODEPS = ["torch-spyre", "vllm", "spyre-inference", "hf-adapters-spyre"]
+# name -> why it is knowingly absent
+ALLOWED_MISSING = {
+    "sentence-transformers": "embedding-only path (hf_adapters/st_backend.py); "
+                             "never reached by GraniteForCausalLM, and it would "
+                             "drag in a second torch resolution",
+}
+
+missing = []
+for dist_name in NODEPS:
+    try:
+        reqs = m.distribution(dist_name).requires or []
+    except m.PackageNotFoundError:
+        raise SystemExit(f"FAIL: {dist_name} is not installed at all")
+    for raw in reqs:
+        r = Requirement(raw)
+        if r.marker is not None:      # extras / platform-conditional: not required
+            continue
+        try:
+            m.version(r.name)
+        except m.PackageNotFoundError:
+            if r.name in ALLOWED_MISSING:
+                print(f"  allowed-missing: {r.name} ({dist_name}) -- {ALLOWED_MISSING[r.name]}")
+            else:
+                missing.append(f"{r.name} (required by {dist_name} as {raw!r})")
+
+if missing:
+    raise SystemExit(
+        "FAIL: --no-deps components have unmet mandatory dependencies:\n  "
+        + "\n  ".join(missing)
+        + "\n\nAdd each to spyre-unified-requirements.txt (with a header note "
+          "explaining the pin), or to ALLOWED_MISSING above with a reason."
+    )
+print("no-deps dependency audit OK:", ", ".join(NODEPS))
+PYEOF
+
+#####################################################################
+# Runtime environment                                               #
+#####################################################################
+# Baked so nothing has to be exported by hand -- in a notebook, in a terminal, or
+# by `vllm serve`. The entrypoint re-exports the FLEX_* pair using ${VAR:=default}
+# so simulator runs (FLEX_COMPUTE=SENTIENT / MOCK) remain possible.
+
+# Real hardware, single physical function. Without these torch-spyre's device
+# backend fails to autoload and tensor.to("spyre") raises.
+ENV FLEX_COMPUTE=hardware \
+    FLEX_DEVICE=PF
+
+# vLLM must load the Spyre platform plugin and its op registrations.
+ENV VLLM_PLUGINS=spyre_inference,spyre_inference_ops
+
+# SPYRE_BATCHED_DECODE=0 is REQUIRED for granite-4.2-8b on this stack. With the
+# default (1), all batched-decode attention variants fail to compile in
+# torch_spyre/_inductor/wsr/for_each_tile_lowering.py with
+#   "AssertionError: tile_dim_marker op ... has 2 consuming reads within its
+#    spliced body; expected exactly one"
+# and the engine dies during warmup. Per-sequence decode compiles fine.
+#
+# SPYRE_ATTN_FOR_EACH_TILE=0 is REQUIRED for the same reason, at the other end of
+# the pipeline: with the default (1) the *paged-attention* variants hit the same
+# assertion -- not during warmup (which reports only "failed to record; it will
+# compile on first use instead") but on the first real forward pass, killing the
+# request. Measured 2026-09-28: padded_query_len 512 and 128 fail identically for
+# every num_blocks in {1,2,4,8,16}, so bucket tuning is NOT a workaround, and
+# head_major is the only KV layout implemented so SPYRE_ATTN_KV_LAYOUT is not one
+# either. Setting 0 makes spyre_inference's walk_tiles()
+# (v1/attention/ops/tile_loop.py) drive the IDENTICAL kernel body under a plain
+# Python for-loop instead of torch-spyre's for_each_tile -- a loop-driver choice,
+# not a numerics change, and the documented purpose of the switch. With both vars
+# set, granite-4.2-8b generates coherent text: warmup 11.99s (vs 120.55s failing),
+# 10/10 per-seq variants recorded on all 40 layers, 3/3 prompts, ~9.7 output tok/s.
+#
+# Revisit BOTH when torch-spyre moves past fcac2334fd.
+ENV SPYRE_BATCHED_DECODE=0 \
+    SPYRE_ATTN_FOR_EACH_TILE=0
+
+# Persistent compiled-kernel cache. Keyed on the OpSpec tree plus the native
+# stack versions from LIB_VERSION_FILE (set by the base image), so it
+# self-invalidates when the Spyre stack is upgraded. Pointed at the PVC under
+# ${HOME} so warm compiles survive pod restarts -- deliberately NOT baked into
+# the image, which would ship a cache that is stale on first boot.
+ENV SPYRE_KERNEL_CACHE=1 \
+    TORCHINDUCTOR_CACHE_DIR=${APP_ROOT}/src/.cache/torchinductor-spyre
+
+# Model weights also live on the PVC, not in the image (granite-4.2-8b is 17 GB).
+ENV HF_HOME=${APP_ROOT}/src/.cache/huggingface
+
+# Quiet the very chatty native logs; raise these when debugging the card.
+ENV DTLOG_LEVEL=error \
+    DT_DEEPRT_VERBOSE=-1 \
+    TORCH_SENDNN_LOG=CRITICAL \
+    PYTHONUNBUFFERED=1
+
 # Copy the start-notebook.sh script
 COPY --chown=default:0 --chmod=755 jupyter/minimal/ubi9-python-3.12/start-notebook-mdev.sh /opt/app-root/bin/start-notebook.sh
 
@@ -59,7 +337,9 @@ USER default
 
 WORKDIR ${NOTEBOOK_ROOT_DIR}
 
-EXPOSE 8888
+# 8888 JupyterLab; 8000 the vLLM OpenAI-compatible server (`vllm serve` default).
+# From a notebook in the same pod, reach it at http://localhost:8000. From
+# outside: oc port-forward <pod> 8000:8000
+EXPOSE 8888 8000
 
 ENTRYPOINT ["/opt/app-root/bin/start-notebook.sh"]
-

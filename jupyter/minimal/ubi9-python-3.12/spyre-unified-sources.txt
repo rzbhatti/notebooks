@@ -1,0 +1,23 @@
+# Source-built packages, in install order. All four are installed with
+# --no-build-isolation --no-deps by Step 3 of Dockerfile.mdev; the revisions here
+# must stay in sync with the ARGs at the top of that file (this file documents the
+# set and is the reference for a manual/pod install -- the Dockerfile uses the ARGs).
+#
+# Build env vars required:
+#   vllm        : VLLM_TARGET_DEVICE=empty CMAKE_ARGS=--fresh  (no device C kernels,
+#                 no vllm._C; Spyre supplies its own ops via the platform plugin.
+#                 Also skips vLLM's Rust frontend, so no Rust toolchain is needed.)
+#   torch-spyre : USE_SPYRE_PROFILER=0, built --no-build-isolation against the
+#                 already-installed torch 2.13.0+cpu and /opt/ibm/spyre headers
+#
+# Because every one of these is installed --no-deps, their declared dependencies
+# are NOT fetched -- they must all be present in spyre-unified-requirements.txt.
+# `pip check` does not catch an absent unversioned dependency, so adding a
+# component here means auditing its requires list by hand. This bit us once:
+# hf-adapters-spyre declares `accelerate` and it was silently missing until
+# run_granite_spyre.py failed (see note 4 in spyre-unified-requirements.txt).
+
+torch-spyre @ git+https://github.com/torch-spyre/torch-spyre@fcac2334fd6019efbc89e3ea5eea560d8a7ded0e
+vllm @ git+https://github.com/vllm-project/vllm@2cf0a6915ce544dc493a0990f2ea38d81601128a
+spyre-inference @ git+https://github.com/torch-spyre/spyre-inference@2ef23a322daf0157f4d155656ef3a121790fde63
+hf-adapters-spyre @ git+https://github.com/torch-spyre/hf-adapters@d1bda3b3f7e296633e7b7815d69785d00b9c0c93

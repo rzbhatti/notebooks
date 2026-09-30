@@ -1,0 +1,19 @@
+# Packages that MUST be installed with --no-deps.
+#
+# torchvision==0.29.0+cpu
+#   Declares torch==2.14.0, but this stack runs torch 2.13.0+cpu. uv rewrites that
+#   transitive pin via override-dependencies; pip has no equivalent. Safe: neither
+#   spyre-inference nor hf-adapters imports torchvision (verified: 0 references in
+#   both). It is present only because spyre-inference lists it as a platform-guarded
+#   direct dep and vLLM declares it for multimodal models we do not use.
+#
+# xgrammar==0.2.8
+#   Declares an UNCONDITIONAL triton on linux/x86_64. triton must stay out (the
+#   plugin blocks it via override-dependencies sys_platform=='never'); without
+#   --no-deps pip drags in triton 3.8.0. All six of xgrammar's other declared deps
+#   (apache-tvm-ffi, pydantic, torch, transformers, numpy, typing-extensions) are
+#   already pinned in the main requirements file, so nothing is lost.
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torchvision==0.29.0+cpu
+xgrammar==0.2.8
